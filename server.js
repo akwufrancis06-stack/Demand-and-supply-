@@ -577,9 +577,8 @@ function updateMitigation(pair, price) {
 }
 
 async function resolveSymbols() {
-  const response = await deriv.request({
-    active_symbols: 'full',
-    product_type: 'basic'
+    const response = await deriv.request({
+    active_symbols: 'brief'
   });
   const symbols = response.active_symbols || [];
   state.activeSymbolsCount = symbols.length;
