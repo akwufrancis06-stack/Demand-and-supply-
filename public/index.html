@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Deriv Supply & Demand Signal Bot</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 18px;
+      background: #0b1220;
+      color: #edf3fb;
+      font-family: Arial, sans-serif;
+    }
+    main { max-width: 1100px; margin: auto; }
+    h1 { font-size: 23px; }
+    .sub { color: #93a4bc; line-height: 1.5; }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
+      gap: 12px;
+    }
+    .card, section {
+      background: #121c2d;
+      border: 1px solid #26354b;
+      border-radius: 12px;
+      padding: 15px;
+      margin-bottom: 14px;
+    }
+    .label { color: #93a4bc; font-size: 12px; }
+    .value { font-size: 21px; font-weight: bold; margin-top: 8px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 540px; }
+    th, td {
+      text-align: left;
+      padding: 11px 8px;
+      border-bottom: 1px solid #26354b;
+      font-size: 13px;
+    }
+    th { color: #93a4bc; }
+    .buy { color: #25b985; font-weight: bold; }
+    .sell { color: #e76a83; font-weight: bold; }
+    .muted { color: #93a4bc; }
+    .signal {
+      padding: 12px;
+      border: 1px solid #26354b;
+      border-radius: 9px;
+      margin: 10px 0;
+      overflow-wrap: anywhere;
+    }
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      color: #b8c9df;
+      font-size: 12px;
+    }
+    footer { color: #93a4bc; font-size: 12px; line-height: 1.6; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Deriv Supply &amp; Demand Signal Bot</h1>
+  <p class="sub">
+    29 Forex pairs + 4 stock targets · Supply &amp; Demand zones ·
+    Immediate touch warning + 5-minute rejection confirmation
+  </p>
+
+  <div class="cards">
+    <div class="card">
+      <div class="label">Connection</div>
+      <div class="value" id="connection">Loading...</div>
+    </div>
+    <div class="card">
+      <div class="label">Target markets</div>
+      <div class="value" id="targets">33</div>
+    </div>
+    <div class="card">
+      <div class="label">Resolved markets</div>
+      <div class="value" id="resolved">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Active zones</div>
+      <div class="value" id="zoneCount">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Recent alerts</div>
+      <div class="value" id="signalCount">—</div>
+    </div>
+  </div>
+
+  <section>
+    <h3>Market status</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Market</th>
+            <th>Deriv symbol</th>
+            <th>Price</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="pairs">
+          <tr><td colspan="4">Waiting for bot data...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h3>Recent Telegram signals</h3>
+    <div id="signals" class="muted">Waiting for signals...</div>
+  </section>
+
+  <section>
+    <h3>Supply &amp; Demand zones</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Market</th>
+            <th>Timeframe</th>
+            <th>Direction</th>
+            <th>Zone bottom</th>
+            <th>Zone top</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="zones">
+          <tr><td colspan="6">Waiting for zones...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h3>System logs</h3>
+    <pre id="logs">Waiting for server...</pre>
+  </section>
+
+  <footer>
+    This dashboard displays data supplied by your bot server. It does not
+    generate trading signals independently. Confirm that Deriv market feeds
+    and Telegram delivery work before relying on alerts. Trading involves risk.
+  </footer>
+</main>
+
+<script>
+  const el = id => document.getElementById(id);
+
+  function price(value) {
+    if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+      return "—";
+    }
+    return String(Number(value));
+  }
+
+  function formatTime(value) {
+    if (!value) return "—";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString();
+  }
+
+  async function refreshDashboard() {
+    try {
+      const response = await fetch("/api/status", { cache: "no-store" });
+      if (!response.ok) throw new Error("Server returned " + response.status);
+
+      const data = await response.json();
+
+      el("connection").textContent =
+        data.connected ? "Connected" : "Disconnected";
+
+      el("resolved").textContent =
+        Array.isArray(data.pairs)
+          ? data.pairs.filter(pair => pair.symbol).length
+          : "—";
+
+      el("targets").textContent = data.targetPairCount ?? 33;
+
+      el("zoneCount").textContent =
+        Array.isArray(data.zones)
+          ? data.zones.filter(zone => !zone.mitigated).length
+          : "—";
+
+      el("signalCount").textContent =
+        Array.isArray(data.signals) ? data.signals.length : "—";
+
+      el("pairs").innerHTML = (data.pairs || []).map(pair => `
+        <tr>
+          <td>${pair.display || pair.pair || "—"}</td>
+          <td>${pair.symbol || "Unavailable"}</td>
+          <td>${price(pair.price)}</td>
+          <td>${pair.status || "Waiting"}</td>
+        </tr>
+      `).join("") || '<tr><td colspan="4">No market data available.</td></tr>';
+
+      el("signals").innerHTML = (data.signals || [])
+        .slice(0, 20)
+        .map(signal => `
+          <div class="signal">
+            <strong class="${signal.direction === "BUY" ? "buy" : "sell"}">
+              ${signal.direction || "ALERT"} ${signal.pair || ""}
+            </strong>
+            <p>${signal.alertType || signal.type || "Signal"}</p>
+            <p class="muted">${formatTime(signal.time)}</p>
+            <p>
+              Entry: ${price(signal.entry)} |
+              SL: ${price(signal.sl)} |
+              TP: ${price(signal.tp)}
+            </p>
+          </div>
+        `).join("") || '<p class="muted">No signals yet.</p>';
+
+      el("zones").innerHTML = (data.zones || [])
+        .slice(0, 100)
+        .map(zone => `
+          <tr>
+            <td>${zone.pair || "—"}</td>
+            <td>${zone.timeframe || "—"}</td>
+            <td class="${zone.direction === "BUY" ? "buy" : "sell"}">
+              ${zone.direction || "—"}
+            </td>
+            <td>${price(zone.bottom)}</td>
+            <td>${price(zone.top)}</td>
+            <td>${zone.mitigated ? "Mitigated" : "Active"}</td>
+          </tr>
+        `).join("") ||
+        '<tr><td colspan="6">No zones detected yet.</td></tr>';
+
+      el("logs").textContent =
+        Array.isArray(data.logs) ? data.logs.join("\n") : "No logs available.";
+
+    } catch (error) {
+      el("connection").textContent = "Dashboard error";
+      el("logs").textContent =
+        "Could not load /api/status. Check the server route and Railway logs.\n" +
+        error.message;
+    }
+  }
+
+  refreshDashboard();
+  setInterval(refreshDashboard, 5000);
+</script>
+</body>
+</html>
