@@ -591,56 +591,109 @@ function updateMitigation(pair, price) {
   }
 }
 
+
 async function resolveSymbols() {
-    const response = await deriv.request({
+  const response = await deriv.request({
     active_symbols: 'brief'
   });
+
   const symbols = response.active_symbols || [];
   state.activeSymbolsCount = symbols.length;
 
   const available = new Map();
+
+  const normalize = value =>
+    String(value || '')
+      .replace(/[^A-Z0-9]/gi, '')
+      .toUpperCase();
+
   for (const item of symbols) {
-    const symbol = String(item.symbol || item.underlying_symbol || '');
-    const display = String(item.display_name || item.underlying_symbol_name || item.name || '');
-    const market = String(item.market || '').toLowerCase();
-    const submarket = String(item.submarket || '').toLowerCase();
+    const symbol = String(
+      item.symbol || item.underlying_symbol || ''
+    ).toUpperCase();
 
-    // Never use OTC instruments.
-    if (display.toUpperCase().includes('OTC') || symbol.toUpperCase().includes('OTC')) continue;
-    if (submarket.includes('otc')) continue;
+    const display = String(
+      item.display_name ||
+      item.underlying_symbol_name ||
+      item.name ||
+      ''
+    ).toUpperCase();
 
-    const stockCandidate = normalizeStock(`${symbol} ${display}`);
-    if (stockCandidate && (market.includes('stock') || market.includes('financial') || /\.(OQ|N)$/.test(symbol))) {
-      if (!available.has(stockCandidate)) available.set(stockCandidate, symbol);
+    const submarket = String(
+      item.submarket || ''
+    ).toLowerCase();
+
+    const combined = `${symbol} ${display}`;
+
+    // Skip OTC markets
+    if (
+      combined.includes('OTC') ||
+      submarket.includes('otc')
+    ) {
       continue;
     }
 
-    const pair = normalizePair(display);
-    const symbolPair = normalizePair(symbol.replace(/^frx/i, ''));
-    const candidate = pair.length === 6 ? pair : symbolPair.length === 6 ? symbolPair : '';
-    if (!candidate || !/^[A-Z]{6}$/.test(candidate)) continue;
-    if (market && !market.includes('forex') && !market.includes('financial')) continue;
-    if (!available.has(candidate)) available.set(candidate, symbol);
+    // Normalize Deriv symbols and display names
+    const symbolKey = normalize(
+      symbol.replace(/^FRX/, '')
+    );
+    const displayKey = normalize(display);
+
+    for (const target of TARGET_PAIRS) {
+      if (
+        symbolKey === target ||
+        displayKey === target
+      ) {
+        if (!available.has(target)) {
+          available.set(target, symbol);
+        }
+      }
+    }
   }
 
+  // Rebuild target market status
   for (const pair of TARGET_PAIRS) {
-    const symbol = available.get(pair);
+    const resolvedSymbol = available.get(pair);
+
     state.pairs[pair] = {
       pair,
       display: prettyPair(pair),
-      symbol: symbol || null,
-      status: symbol ? 'Waiting for first scan' : 'Unavailable on Deriv',
-      price: null, priceTime: null, lastScan: null, error: ''
+      symbol: resolvedSymbol || null,
+      status: resolvedSymbol
+        ? 'Waiting for first scan'
+        : 'Unavailable on Deriv',
+      price: null,
+      priceTime: null,
+      lastScan: null,
+      error: ''
     };
   }
 
-  const resolved = TARGET_PAIRS.filter(pair => state.pairs[pair].symbol);
-  const missing = TARGET_PAIRS.filter(pair => !state.pairs[pair].symbol);
-  log(`Deriv resolved ${resolved.length}/${TARGET_PAIRS.length} target pairs.`);
-  if (missing.length) log(`Unavailable pairs: ${missing.map(prettyPair).join(', ')}`);
+  const resolved = TARGET_PAIRS.filter(
+    pair => state.pairs[pair].symbol
+  );
 
-  deriv.subscribeTicks(resolved.map(pair => state.pairs[pair].symbol));
+  const missing = TARGET_PAIRS.filter(
+    pair => !state.pairs[pair].symbol
+  );
+
+  log(
+    `Deriv resolved ${resolved.length}/${TARGET_PAIRS.length} target markets.`
+  );
+
+  if (missing.length) {
+    log(
+      `Unavailable markets: ${missing.map(prettyPair).join(', ')}`
+    );
+  }
+
+  if (resolved.length) {
+    deriv.subscribeTicks(
+      resolved.map(pair => state.pairs[pair].symbol)
+    );
+  }
 }
+
 
 async function scanPair(pair) {
   const p = state.pairs[pair];
