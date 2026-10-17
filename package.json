@@ -1,0 +1,16 @@
+{
+  "name": "deriv-supply-demand-telegram-bot",
+  "version": "1.0.0",
+  "description": "Deriv market-data Supply & Demand / Order Block zone-touch Telegram signal bot",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  }
+}
