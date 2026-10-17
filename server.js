@@ -1,5 +1,6 @@
 'use strict';
 
+const path = require('path');
 const express = require('express');
 const WebSocket = require('ws');
 
@@ -11,6 +12,8 @@ const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
 const DERIV_WS_URL = `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(DERIV_APP_ID)}`;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+// Optional. If set, the dashboard and /api/status require this token.
+const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || '';
 
 const SCAN_INTERVAL_MS = Math.max(60_000, Number(process.env.SCAN_INTERVAL_MS || 300_000));
 const REQUEST_TIMEOUT_MS = 25_000;
@@ -22,9 +25,8 @@ const CONFIRMATION_MAX_AGE_MS = 30 * 60 * 1000;
 const STOCKS = ['AAPL', 'TSLA', 'NVDA', 'AMZN'];
 const RR = 2;
 const ATR_PERIOD = 14;
-const IMPULSE_ATR_MULTIPLIER = 0.8;
 
-// 29 Forex pairs are preserved; slots 30-33 are stocks.
+// 28 Forex pairs, followed by 4 stock slots.
 // Deriv active_symbols is authoritative; unavailable instruments are skipped.
 const TARGET_PAIRS = [
   'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'USDCAD', 'AUDUSD', 'NZDUSD',
@@ -53,6 +55,9 @@ const state = {
   pendingConfirmations: [],
   logs: []
 };
+
+let scanning = false;
+const lastAlertAt = new Map();
 
 function log(message) {
   const entry = `${new Date().toISOString()} ${message}`;
@@ -132,29 +137,30 @@ function analyseStructure(candles) {
   let bias = 'NEUTRAL';
   const seenHighs = new Set(), seenLows = new Set();
   const byIndex = new Map();
+
   for (const p of pivots.highs) byIndex.set(p.index, [...(byIndex.get(p.index) || []), { ...p, kind: 'HIGH' }]);
   for (const p of pivots.lows) byIndex.set(p.index, [...(byIndex.get(p.index) || []), { ...p, kind: 'LOW' }]);
 
   for (let i = 0; i < candles.length; i++) {
     for (const p of (byIndex.get(i) || [])) {
-      if (p.kind === 'HIGH') {
-        p.label = lastHigh ? (p.price > lastHigh.price ? 'HH' : 'LH') : 'H';
-        lastHigh = p;
-      } else {
-        p.label = lastLow ? (p.price > lastLow.price ? 'HL' : 'LL') : 'L';
-        lastLow = p;
-      }
+      if (p.kind === 'HIGH') lastHigh = p;
+      else lastLow = p;
     }
     const c = candles[i];
     if (lastHigh && c.close > lastHigh.price && !seenHighs.has(lastHigh.index)) {
-      const event = { index: i, epoch: c.epoch, type: bias === 'SELL' ? 'CHoCH' : 'BOS', direction: 'BUY', level: lastHigh.price, pivotIndex: lastHigh.index };
-      events.push(event); seenHighs.add(lastHigh.index); bias = 'BUY'; protectedLow = lastLow;
+      events.push({ index: i, epoch: c.epoch, type: bias === 'SELL' ? 'CHoCH' : 'BOS', direction: 'BUY', level: lastHigh.price, pivotIndex: lastHigh.index });
+      seenHighs.add(lastHigh.index);
+      bias = 'BUY';
+      protectedLow = lastLow;
     }
     if (lastLow && c.close < lastLow.price && !seenLows.has(lastLow.index)) {
-      const event = { index: i, epoch: c.epoch, type: bias === 'BUY' ? 'CHoCH' : 'BOS', direction: 'SELL', level: lastLow.price, pivotIndex: lastLow.index };
-      events.push(event); seenLows.add(lastLow.index); bias = 'SELL'; protectedHigh = lastHigh;
+      events.push({ index: i, epoch: c.epoch, type: bias === 'BUY' ? 'CHoCH' : 'BOS', direction: 'SELL', level: lastLow.price, pivotIndex: lastLow.index });
+      seenLows.add(lastLow.index);
+      bias = 'SELL';
+      protectedHigh = lastHigh;
     }
   }
+
   const rangeHigh = lastHigh ? lastHigh.price : null;
   const rangeLow = lastLow ? lastLow.price : null;
   return { pivots, events, bias, rangeHigh, rangeLow, protectedHigh, protectedLow };
@@ -165,17 +171,19 @@ function makeZones(pair, tf, candles) {
   if (!Array.isArray(candles) || candles.length < ATR_PERIOD + 12) return result;
   const atr = calcATR(candles);
   if (!atr || !Number.isFinite(atr)) return result;
+
   const structure = analyseStructure(candles);
   const start = Math.max(1, candles.length - ZONE_LOOKBACK);
   const recentEvents = structure.events.filter(e => e.index >= start && e.index < candles.length - 1);
 
-  // Approximation of JP7FX's described behavior: confirmed close-based BOS/CHoCH
-  // events create an Order Block from the nearest opposite-colour source candle.
+  // Approximation of the described behavior: confirmed close-based BOS/CHoCH
+  // events create an order block from the nearest opposite-colour candle.
   // This is not the protected indicator's code and will not match it exactly.
   for (const event of recentEvents) {
     const impulse = candles[event.index];
     const body = Math.abs(impulse.close - impulse.open);
     if (body < atr * 0.35) continue;
+
     let sourceIndex = -1;
     for (let j = event.index - 1; j >= Math.max(0, event.index - 8); j--) {
       const c = candles[j];
@@ -183,10 +191,12 @@ function makeZones(pair, tf, candles) {
       if (opposite) { sourceIndex = j; break; }
     }
     if (sourceIndex < 0) continue;
+
     const source = candles[sourceIndex];
     const top = Math.max(source.open, source.high);
     const bottom = Math.min(source.open, source.low);
     if (!(top > bottom)) continue;
+
     const direction = event.direction;
     const current = candles[candles.length - 2]; // latest fully closed candle
     const invalidated = direction === 'BUY' ? current.close < bottom : current.close > top;
@@ -194,18 +204,18 @@ function makeZones(pair, tf, candles) {
     const rangeLow = structure.rangeLow;
     const midpoint = Number.isFinite(rangeHigh) && Number.isFinite(rangeLow) ? (rangeHigh + rangeLow) / 2 : null;
     const rangePosition = midpoint == null ? 'UNKNOWN' : (current.close >= midpoint ? 'PREMIUM' : 'DISCOUNT');
+
     result.push({
       id: `${pair}-${tf.label}-${direction === 'BUY' ? 'D' : 'S'}-${source.epoch}-${event.type}`,
       pair, timeframe: tf.label, direction, top, bottom,
       createdAt: source.epoch, eventType: event.type, eventEpoch: event.epoch,
       breakLevel: event.level, rangeHigh, rangeLow, equilibrium: midpoint,
-      rangePosition, mitigated: invalidated, alerted: false,
+      rangePosition, mitigated: invalidated,
       structureBias: structure.bias, sourceCandleEpoch: source.epoch
     });
   }
 
-  // Add a range sweep annotation to the newest zone when a wick crosses a
-  // confirmed structural boundary but the candle closes back inside it.
+  // Annotate sweeps: a wick beyond a structural boundary that closes back inside.
   const lastClosed = candles[candles.length - 2];
   for (const z of result) {
     if (Number.isFinite(z.rangeHigh) && lastClosed.high > z.rangeHigh && lastClosed.close < z.rangeHigh) z.rangeSweep = 'HIGH_SWEEP';
@@ -213,11 +223,13 @@ function makeZones(pair, tf, candles) {
     else z.rangeSweep = null;
   }
 
+  // De-duplicate identical zones, keeping the most recent ones.
   const seen = new Set();
   return result.reverse().filter(z => {
     const key = `${z.direction}:${z.top.toFixed(6)}:${z.bottom.toFixed(6)}`;
     if (seen.has(key)) return false;
-    seen.add(key); return true;
+    seen.add(key);
+    return true;
   }).reverse().slice(-MAX_ZONES_PER_PAIR_TF);
 }
 
@@ -228,26 +240,35 @@ class DerivSocket {
     this.pending = new Map();
     this.connecting = null;
     this.reconnectTimer = null;
+    this.tickSymbols = [];
   }
 
-  async connect() {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
+  connect() {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) return Promise.resolve();
     if (this.connecting) return this.connecting;
 
     this.connecting = new Promise((resolve, reject) => {
       const ws = new WebSocket(DERIV_WS_URL);
+      let settled = false;
+
       const timeout = setTimeout(() => {
-        try { ws.terminate(); } catch (_) {}
-        reject(new Error('Deriv WebSocket connection timed out'));
+        if (!settled) {
+          settled = true;
+          try { ws.terminate(); } catch (_) {}
+          reject(new Error('Deriv WebSocket connection timed out'));
+        }
       }, 15000);
 
       ws.on('open', () => {
+        settled = true;
         clearTimeout(timeout);
         this.ws = ws;
         state.connected = true;
         state.lastError = '';
         log('Connected to Deriv public market-data WebSocket.');
         resolve();
+        // Ticks are per-connection, so restore them after every reconnect.
+        if (this.tickSymbols.length) this.subscribeTicks(this.tickSymbols);
       });
 
       ws.on('message', raw => {
@@ -270,10 +291,22 @@ class DerivSocket {
       ws.on('error', err => {
         state.lastError = `WebSocket: ${err.message}`;
         log(state.lastError);
-        if (this.ws !== ws) reject(err);
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          reject(err);
+        }
       });
 
       ws.on('close', () => {
+        clearTimeout(timeout);
+        if (!settled) {
+          settled = true;
+          reject(new Error('Deriv WebSocket closed before opening'));
+        }
+        // Only handle the close of the live socket. A failed attempt is retried by its caller.
+        if (this.ws !== ws) return;
+
         state.connected = false;
         this.ws = null;
         for (const [id, pending] of this.pending) {
@@ -281,20 +314,24 @@ class DerivSocket {
           pending.reject(new Error('Deriv WebSocket closed'));
           this.pending.delete(id);
         }
-        log('Deriv WebSocket closed; reconnect will be attempted.');
-        if (!this.reconnectTimer) {
-          this.reconnectTimer = setTimeout(() => {
-            this.reconnectTimer = null;
-            this.connect().catch(err => {
-              state.lastError = err.message;
-              log(`Reconnect failed: ${err.message}`);
-            });
-          }, 5000);
-        }
+        log('Deriv WebSocket closed; reconnect scheduled.');
+        this.scheduleReconnect();
       });
     }).finally(() => { this.connecting = null; });
 
     return this.connecting;
+  }
+
+  scheduleReconnect() {
+    if (this.reconnectTimer) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect().catch(err => {
+        state.lastError = err.message;
+        log(`Reconnect failed: ${err.message}`);
+        this.scheduleReconnect();
+      });
+    }, 5000);
   }
 
   async request(payload) {
@@ -329,14 +366,13 @@ class DerivSocket {
       granularity,
       style: 'candles'
     });
-    const candles = (data.candles || []).map(c => ({
+    return (data.candles || []).map(c => ({
       epoch: Number(c.epoch),
       open: Number(c.open),
       high: Number(c.high),
       low: Number(c.low),
       close: Number(c.close)
     })).filter(c => [c.epoch, c.open, c.high, c.low, c.close].every(Number.isFinite));
-    return candles;
   }
 
   handleTick(tick) {
@@ -356,22 +392,24 @@ class DerivSocket {
   }
 
   subscribeTicks(symbols) {
-    // Deriv supports an array of symbols for tick subscriptions.
+    this.tickSymbols = [...symbols];
     if (!symbols.length) return;
+
     this.request({ ticks: symbols, subscribe: 1 })
       .then(() => log(`Subscribed to live ticks for ${symbols.length} available pairs.`))
       .catch(err => {
         log(`Batch tick subscription failed; trying per-symbol subscriptions: ${err.message}`);
         symbols.forEach((symbol, i) => {
-          setTimeout(() => this.request({ ticks: symbol, subscribe: 1 })
-            .catch(e => log(`Tick subscription failed for ${symbol}: ${e.message}`)), i * 150);
+          setTimeout(() => {
+            this.request({ ticks: symbol, subscribe: 1 })
+              .catch(e => log(`Tick subscription failed for ${symbol}: ${e.message}`));
+          }, i * 150);
         });
       });
   }
 }
 
 const deriv = new DerivSocket();
-const lastAlertAt = new Map();
 
 async function sendTelegram(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
@@ -416,15 +454,19 @@ function checkZoneTouches(pair, price) {
 
     lastAlertAt.set(cooldownKey, now);
     zone.alerted = true;
+
     const pending = {
-      id: `${Date.now()}-${pair}-${zone.direction}-touch`, zoneId: zone.id,
+      id: `${now}-${pair}-${zone.direction}-touch`,
+      zoneId: zone.id,
       pair, direction: zone.direction, timeframe: zone.timeframe,
       touchedAt: now, touchPrice: price, zoneTop: zone.top, zoneBottom: zone.bottom,
       eventType: zone.eventType || 'OB', rangePosition: zone.rangePosition || 'UNKNOWN',
       sl, tp, completed: false
     };
     state.pendingConfirmations.push(pending);
-    state.pendingConfirmations = state.pendingConfirmations.filter(item => now - item.touchedAt < CONFIRMATION_MAX_AGE_MS * 2).slice(-200);
+    state.pendingConfirmations = state.pendingConfirmations
+      .filter(item => now - item.touchedAt < CONFIRMATION_MAX_AGE_MS * 2)
+      .slice(-200);
 
     const signal = {
       id: pending.id, time: new Date(now).toISOString(), pair,
@@ -440,7 +482,7 @@ function checkZoneTouches(pair, price) {
       `Zone source: ${zone.timeframe} ${zone.direction === 'BUY' ? 'DEMAND' : 'SUPPLY'}`,
       `Structure event: ${zone.eventType || 'OB'}${zone.rangeSweep ? ` | ${zone.rangeSweep}` : ''}`,
       `Range position: ${zone.rangePosition || 'UNKNOWN'}`,
-      `Live price: ${fmtPrice(pair, price)}`,
+      `Live price at touch: ${fmtPrice(pair, price)}`,
       `Zone: ${fmtPrice(pair, zone.bottom)} – ${fmtPrice(pair, zone.top)}`,
       `Next: waiting for a completed 5M rejection candle.`,
       `Price source: Deriv`,
@@ -449,67 +491,87 @@ function checkZoneTouches(pair, price) {
 
     sendTelegram(message)
       .then(ok => log(`${ok ? 'Telegram sent' : 'Signal recorded'}: ZONE TOUCH ${zone.direction} ${pair}`))
-      .catch(err => { log(`Telegram send failed: ${err.message}`); state.lastError = `Telegram: ${err.message}`; });
+      .catch(err => {
+        log(`Telegram send failed: ${err.message}`);
+        state.lastError = `Telegram: ${err.message}`;
+      });
   }
 }
 
+// Checks every closed 5M candle since the touch, not just the latest one.
+// Each pending touch can fire at most one confirmation.
 function confirmRejections(pair, candles) {
   if (!Array.isArray(candles) || candles.length < 3) return;
-  // The last candle may still be forming; use the most recently completed candle.
-  const candle = candles[candles.length - 2];
-  if (!candle || !Number.isFinite(candle.epoch)) return;
-  const candleEnd = (candle.epoch + 300) * 1000;
   const now = Date.now();
-  if (now - candleEnd > CONFIRMATION_MAX_AGE_MS || candleEnd > now + 60_000) return;
+  const closed = candles.slice(0, -1); // the last candle may still be forming
 
   for (const pending of state.pendingConfirmations) {
-    if (pending.completed || pending.pair !== pair || candleEnd <= pending.touchedAt) continue;
-    if (now - pending.touchedAt > CONFIRMATION_MAX_AGE_MS) { pending.completed = true; continue; }
-    const overlapsZone = candle.low <= pending.zoneTop && candle.high >= pending.zoneBottom;
-    if (!overlapsZone) continue;
-    const range = Math.max(candle.high - candle.low, 1e-12);
-    const lowerWick = Math.min(candle.open, candle.close) - candle.low;
-    const upperWick = candle.high - Math.max(candle.open, candle.close);
-    const bullishReject = pending.direction === 'BUY' && candle.close > candle.open && lowerWick / range >= 0.25 && candle.close >= pending.zoneBottom;
-    const bearishReject = pending.direction === 'SELL' && candle.close < candle.open && upperWick / range >= 0.25 && candle.close <= pending.zoneTop;
-    if (!bullishReject && !bearishReject) continue;
+    if (pending.completed || pending.pair !== pair) continue;
+    if (now - pending.touchedAt > CONFIRMATION_MAX_AGE_MS) {
+      pending.completed = true;
+      continue;
+    }
 
-    pending.completed = true;
-    const entry = candle.close;
-    const risk = pending.direction === 'BUY' ? entry - pending.sl : pending.sl - entry;
-    if (risk <= 0) { log(`Confirmation skipped: invalid risk for ${pair}`); continue; }
-    const tp = pending.direction === 'BUY' ? entry + RR * risk : entry - RR * risk;
-    const signal = {
-      id: `${pending.id}-confirmed`, time: new Date().toISOString(), pair,
-      direction: pending.direction, timeframe: '5M', type: 'CONFIRMED_ENTRY',
-      entry, sl: pending.sl, tp, zoneTop: pending.zoneTop, zoneBottom: pending.zoneBottom,
-      note: 'Completed 5M rejection candle detected; confirm execution conditions.'
-    };
-    state.signals.unshift(signal);
-    state.signals = state.signals.slice(0, 100);
-    const message = [
-      `✅ 5M REJECTION CONFIRMED — ${pending.direction} ${prettyPair(pair)}`,
-      `Entry (completed 5M close): ${fmtPrice(pair, entry)}`,
-      `Stop Loss: ${fmtPrice(pair, pending.sl)}`,
-      `Take Profit (1:${RR}): ${fmtPrice(pair, tp)}`,
-      `Zone: ${fmtPrice(pair, pending.zoneBottom)} – ${fmtPrice(pair, pending.zoneTop)}`,
-      `Structure event: ${pending.eventType || 'OB'} | Range: ${pending.rangePosition || 'UNKNOWN'}`,
-      `Confirmation candle: ${new Date(candle.epoch * 1000).toISOString()}`,
-      `Price source: Deriv`,
-      `⚠️ Confirmation is rule-based, not a guarantee of reversal.`
-    ].join('\n');
-    sendTelegram(message)
-      .then(ok => log(`${ok ? 'Telegram sent' : 'Signal recorded'}: CONFIRMED ${pending.direction} ${pair}`))
-      .catch(err => { log(`Telegram send failed: ${err.message}`); state.lastError = `Telegram: ${err.message}`; });
+    for (const candle of closed) {
+      const candleEnd = (candle.epoch + 300) * 1000;
+      if (candleEnd <= pending.touchedAt) continue; // closed before the touch
+
+      const overlapsZone = candle.low <= pending.zoneTop && candle.high >= pending.zoneBottom;
+      if (!overlapsZone) continue;
+
+      const range = Math.max(candle.high - candle.low, 1e-12);
+      const lowerWick = Math.min(candle.open, candle.close) - candle.low;
+      const upperWick = candle.high - Math.max(candle.open, candle.close);
+      const bullishReject = pending.direction === 'BUY' && candle.close > candle.open && lowerWick / range >= 0.25 && candle.close >= pending.zoneBottom;
+      const bearishReject = pending.direction === 'SELL' && candle.close < candle.open && upperWick / range >= 0.25 && candle.close <= pending.zoneTop;
+      if (!bullishReject && !bearishReject) continue;
+
+      const entry = candle.close;
+      const risk = pending.direction === 'BUY' ? entry - pending.sl : pending.sl - entry;
+      if (risk <= 0) {
+        log(`Confirmation skipped: invalid risk for ${pair}`);
+        continue;
+      }
+      const tp = pending.direction === 'BUY' ? entry + RR * risk : entry - RR * risk;
+
+      pending.completed = true;
+
+      const signal = {
+        id: `${pending.id}-confirmed`, time: new Date().toISOString(), pair,
+        direction: pending.direction, timeframe: '5M', type: 'CONFIRMED_ENTRY',
+        entry, sl: pending.sl, tp, zoneTop: pending.zoneTop, zoneBottom: pending.zoneBottom,
+        note: 'Completed 5M rejection candle detected; confirm execution conditions.'
+      };
+      state.signals.unshift(signal);
+      state.signals = state.signals.slice(0, 100);
+
+      const message = [
+        `✅ 5M REJECTION CONFIRMED — ${pending.direction} ${prettyPair(pair)}`,
+        `Reference entry (5M close): ${fmtPrice(pair, entry)}`,
+        `Stop Loss: ${fmtPrice(pair, pending.sl)}`,
+        `Take Profit (1:${RR}): ${fmtPrice(pair, tp)}`,
+        `Zone: ${fmtPrice(pair, pending.zoneBottom)} – ${fmtPrice(pair, pending.zoneTop)}`,
+        `Structure event: ${pending.eventType || 'OB'} | Range: ${pending.rangePosition || 'UNKNOWN'}`,
+        `Confirmation candle: ${new Date(candle.epoch * 1000).toISOString()}`,
+        `Price source: Deriv`,
+        `⚠️ Confirmation is rule-based, not a guarantee of reversal.`
+      ].join('\n');
+
+      sendTelegram(message)
+        .then(ok => log(`${ok ? 'Telegram sent' : 'Signal recorded'}: CONFIRMED ${pending.direction} ${pair}`))
+        .catch(err => {
+          log(`Telegram send failed: ${err.message}`);
+          state.lastError = `Telegram: ${err.message}`;
+        });
+      break; // one confirmation per pending touch
+    }
   }
 }
 
 function updateMitigation(pair, price) {
   for (const zone of state.zones) {
     if (zone.pair !== pair || zone.mitigated) continue;
-    const fullyBroken = zone.direction === 'BUY'
-      ? price < zone.bottom
-      : price > zone.top;
+    const fullyBroken = zone.direction === 'BUY' ? price < zone.bottom : price > zone.top;
     if (fullyBroken) zone.mitigated = true;
   }
 }
@@ -529,14 +591,16 @@ async function resolveSymbols() {
     const market = String(item.market || '').toLowerCase();
     const submarket = String(item.submarket || '').toLowerCase();
 
-    // Match listed stocks by ticker/suffix and FX by six-letter pair. Never use OTC.
+    // Never use OTC instruments.
     if (display.toUpperCase().includes('OTC') || symbol.toUpperCase().includes('OTC')) continue;
-    if (submarket && submarket.includes('otc')) continue;
+    if (submarket.includes('otc')) continue;
+
     const stockCandidate = normalizeStock(`${symbol} ${display}`);
     if (stockCandidate && (market.includes('stock') || market.includes('financial') || /\.(OQ|N)$/.test(symbol))) {
       if (!available.has(stockCandidate)) available.set(stockCandidate, symbol);
       continue;
     }
+
     const pair = normalizePair(display);
     const symbolPair = normalizePair(symbol.replace(/^frx/i, ''));
     const candidate = pair.length === 6 ? pair : symbolPair.length === 6 ? symbolPair : '';
@@ -548,7 +612,9 @@ async function resolveSymbols() {
   for (const pair of TARGET_PAIRS) {
     const symbol = available.get(pair);
     state.pairs[pair] = {
-      pair, display: prettyPair(pair), symbol: symbol || null,
+      pair,
+      display: prettyPair(pair),
+      symbol: symbol || null,
       status: symbol ? 'Waiting for first scan' : 'Unavailable on Deriv',
       price: null, priceTime: null, lastScan: null, error: ''
     };
@@ -558,6 +624,7 @@ async function resolveSymbols() {
   const missing = TARGET_PAIRS.filter(pair => !state.pairs[pair].symbol);
   log(`Deriv resolved ${resolved.length}/${TARGET_PAIRS.length} target pairs.`);
   if (missing.length) log(`Unavailable pairs: ${missing.map(prettyPair).join(', ')}`);
+
   deriv.subscribeTicks(resolved.map(pair => state.pairs[pair].symbol));
 }
 
@@ -582,7 +649,7 @@ async function scanPair(pair) {
     if (atr5m) p.atr5m = atr5m;
     confirmRejections(pair, candles5m);
 
-    // Keep zones that are not fully broken at current observed price.
+    // Carry over the mitigated flag for zones that were already broken.
     const oldForPair = state.zones.filter(z => z.pair === pair);
     const newById = new Map(allZones.map(z => [z.id, z]));
     for (const old of oldForPair) {
@@ -606,29 +673,71 @@ async function scanPair(pair) {
 }
 
 async function runScan() {
-  if (!state.connected) {
-    try { await deriv.connect(); } catch (err) {
-      state.lastError = err.message;
-      log(`Cannot scan while disconnected: ${err.message}`);
-      return;
-    }
+  // Prevent overlapping scans if one runs longer than the interval.
+  if (scanning) {
+    log('Previous scan still running; skipping this interval.');
+    return;
   }
-  const pairs = TARGET_PAIRS.filter(pair => state.pairs[pair] && state.pairs[pair].symbol);
-  // Limit concurrent history requests to reduce load on the public API.
-  let cursor = 0;
-  const workers = Array.from({ length: 3 }, async () => {
-    while (cursor < pairs.length) {
-      const pair = pairs[cursor++];
-      await scanPair(pair);
+  scanning = true;
+  try {
+    if (!state.connected) {
+      await deriv.connect();
     }
-  });
-  await Promise.all(workers);
-  state.lastScan = new Date().toISOString();
-  log(`Scan completed. Active configured pairs: ${pairs.length}. Zones tracked: ${state.zones.length}.`);
+    const pairs = TARGET_PAIRS.filter(pair => state.pairs[pair] && state.pairs[pair].symbol);
+    // Three workers keeps load on the public API reasonable.
+    let cursor = 0;
+    const workers = Array.from({ length: 3 }, async () => {
+      while (cursor < pairs.length) {
+        const pair = pairs[cursor++];
+        await scanPair(pair);
+      }
+    });
+    await Promise.all(workers);
+    state.lastScan = new Date().toISOString();
+    log(`Scan completed. Active configured pairs: ${pairs.length}. Zones tracked: ${state.zones.length}.`);
+  } catch (err) {
+    state.lastError = err.message;
+    log(`Scan aborted: ${err.message}`);
+  } finally {
+    scanning = false;
+  }
 }
 
-app.get('/', (_req, res) => res.sendFile(require('path').join(__dirname, 'public', 'index.html')));
-app.get('/api/status', (_req, res) => {
+async function startUp() {
+  while (true) {
+    try {
+      await deriv.connect();
+      if (!Object.values(state.pairs).some(p => p.symbol)) await resolveSymbols();
+      break;
+    } catch (err) {
+      state.lastError = err.message;
+      log(`Startup failed, retrying in 30s: ${err.message}`);
+      await sleep(30_000);
+    }
+  }
+
+  await runScan();
+  setInterval(() => {
+    runScan().catch(err => {
+      state.lastError = err.message;
+      log(`Scheduled scan error: ${err.message}`);
+    });
+  }, SCAN_INTERVAL_MS);
+}
+
+function requireDashboardAuth(req, res, next) {
+  if (!DASHBOARD_TOKEN) return next();
+  const header = req.headers.authorization || '';
+  const provided = header.startsWith('Bearer ') ? header.slice(7) : String(req.query.token || '');
+  if (provided === DASHBOARD_TOKEN) return next();
+  res.status(401).json({ error: 'Unauthorized' });
+}
+
+app.get('/', requireDashboardAuth, (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.get('/api/status', requireDashboardAuth, (_req, res) => {
   res.json({
     startedAt: state.startedAt,
     connected: state.connected,
@@ -641,37 +750,19 @@ app.get('/api/status', (_req, res) => {
     pairs: Object.values(state.pairs),
     zones: state.zones.slice().sort((a, b) => b.createdAt - a.createdAt),
     structureSummary: state.zones.reduce((acc, z) => {
-      acc[z.eventType || 'OB'] = (acc[z.eventType || 'OB'] || 0) + 1;
+      const key = z.eventType || 'OB';
+      acc[key] = (acc[key] || 0) + 1;
       return acc;
     }, {}),
     signals: state.signals,
     logs: state.logs
   });
 });
+
+// Health check stays open so hosting platforms can probe it.
 app.get('/health', (_req, res) => res.json({ ok: true, connected: state.connected }));
 
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
   log(`Dashboard listening on port ${PORT}`);
-  try {
-    await deriv.connect();
-    await resolveSymbols();
-    await runScan();
-    setInterval(() => runScan().catch(err => {
-      state.lastError = err.message;
-      log(`Scheduled scan error: ${err.message}`);
-    }), SCAN_INTERVAL_MS);
-  } catch (err) {
-    state.lastError = err.message;
-    log(`Startup error: ${err.message}`);
-    // Keep the dashboard alive and retry initialization.
-    setInterval(async () => {
-      try {
-        if (!Object.values(state.pairs).some(p => p.symbol)) await resolveSymbols();
-        await runScan();
-      } catch (e) {
-        state.lastError = e.message;
-        log(`Retry error: ${e.message}`);
-      }
-    }, 30_000);
-  }
+  startUp();
 });
