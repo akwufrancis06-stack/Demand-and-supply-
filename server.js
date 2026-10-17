@@ -598,6 +598,16 @@ async function resolveSymbols() {
   });
 
   const symbols = response.active_symbols || [];
+  log(`TOTAL DERIV SYMBOLS: ${symbols.length}`);
+
+for (const item of symbols) {
+  const code = item.symbol || item.underlying_symbol || '';
+  const name = item.display_name || item.underlying_symbol_name || item.name || '';
+
+  if (/BTC|ETH|EURNZD|XAU|GOLD/i.test(`${code} ${name}`)) {
+    log(`SYMBOL CHECK: ${code} | ${name}`);
+  }
+}
   state.activeSymbolsCount = symbols.length;
 
   const available = new Map();
