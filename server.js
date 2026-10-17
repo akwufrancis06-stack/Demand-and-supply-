@@ -28,15 +28,30 @@ const ATR_PERIOD = 14;
 
 // 28 Forex pairs, followed by 4 stock slots.
 // Deriv active_symbols is authoritative; unavailable instruments are skipped.
+
 const TARGET_PAIRS = [
-  'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'USDCAD', 'AUDUSD', 'NZDUSD',
-  'EURGBP', 'EURJPY', 'EURCHF', 'EURCAD', 'EURAUD', 'EURNZD',
-  'GBPJPY', 'GBPCHF', 'GBPCAD', 'GBPAUD', 'GBPNZD',
-  'AUDJPY', 'AUDCHF', 'AUDCAD', 'AUDNZD',
-  'NZDJPY', 'NZDCHF', 'NZDCAD',
+  // Existing Forex pairs
+  'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'USDCAD',
+  'AUDUSD', 'NZDUSD', 'EURGBP', 'EURJPY', 'EURCHF',
+  'EURCAD', 'EURAUD', 'EURNZD', 'GBPJPY', 'GBPCHF',
+  'GBPCAD', 'GBPAUD', 'GBPNZD', 'AUDJPY', 'AUDCHF',
+  'AUDCAD', 'AUDNZD', 'NZDJPY', 'NZDCHF', 'NZDCAD',
   'CADJPY', 'CADCHF', 'CHFJPY',
-  ...STOCKS
+
+  // Additional Forex pairs
+  'USDSGD', 'USDHKD', 'EURSEK', 'EURNOK', 'EURPLN',
+  'EURTRY', 'GBPSEK', 'GBPNOK', 'GBPSGD', 'CADSGD',
+  'CHFSGD',
+
+  // Metals
+  'XAUUSD', 'XAGUSD',
+
+  // Cryptocurrency
+  'BTCUSD', 'ETHUSD', 'BCHUSD', 'LTCUSD', 'XRPUSD',
+  'BNBUSD', 'ADAUSD', 'SOLUSD', 'DOGEUSD', 'DOTUSD',
+  'LINKUSD', 'TRXUSD', 'BTCETH'
 ];
+
 
 const TIMEFRAMES = [
   { label: '4H', seconds: 14400, source: 'HTF' },
