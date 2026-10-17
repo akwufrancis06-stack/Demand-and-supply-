@@ -9,7 +9,7 @@ app.use(express.json());
 
 const PORT = Number(process.env.PORT || 3000);
 const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
-const DERIV_WS_URL = `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(DERIV_APP_ID)}`;
+const DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 // Optional. If set, the dashboard and /api/status require this token.
