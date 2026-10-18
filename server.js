@@ -11,6 +11,7 @@ const PORT = Number(process.env.PORT || 3000);
 const DERIV_WS_URL = 'wss://api.derivws.com/trading/v1/options/ws/public';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY || '';
 // Optional. If set, the dashboard and /api/status require this token.
 const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || '';
 
@@ -18,16 +19,18 @@ const SCAN_INTERVAL_MS = Math.max(60_000, Number(process.env.SCAN_INTERVAL_MS ||
 const REQUEST_TIMEOUT_MS = 25_000;
 const REQUEST_GAP_MS = Math.max(100, Number(process.env.REQUEST_GAP_MS || 250));
 const TICK_SUBSCRIBE_GAP_MS = 200;
+// Twelve Data free plan allows 8 requests per minute. 8 seconds between requests stays under that.
+const TD_GAP_MS = 8000;
 const ZONE_LOOKBACK = 160;
 const MAX_ZONES_PER_PAIR_TF = 8;
 const ZONE_TOUCH_COOLDOWN_MS = 30 * 60 * 1000;
 const CONFIRMATION_MAX_AGE_MS = 30 * 60 * 1000;
-const STOCKS = ['AAPL', 'TSLA', 'NVDA', 'AMZN']; // kept for display only; not scanned
+const STOCKS = ['AAPL', 'TSLA', 'NVDA', 'AMZN']; // display only; not scanned
 const RR = 2;
 const ATR_PERIOD = 14;
 
-// Markets the bot tries to resolve on Deriv. Any not listed by Deriv are skipped.
-const TARGET_PAIRS = [
+// Forex and gold: resolved from Deriv's active symbols.
+const DERIV_PAIRS = [
   // Forex majors and crosses
   'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'USDCAD',
   'AUDUSD', 'NZDUSD', 'EURGBP', 'EURJPY', 'EURCHF',
@@ -41,14 +44,21 @@ const TARGET_PAIRS = [
   'EURTRY', 'GBPSEK', 'GBPNOK', 'GBPSGD', 'CADSGD',
   'CHFSGD',
 
-  // Metals
-  'XAUUSD', 'XAGUSD',
-
-  // Cryptocurrency
-  'BTCUSD', 'ETHUSD', 'BCHUSD', 'LTCUSD', 'XRPUSD',
-  'BNBUSD', 'ADAUSD', 'SOLUSD', 'DOGEUSD', 'DOTUSD',
-  'LINKUSD', 'TRXUSD', 'BTCETH'
+  // Gold
+  'XAUUSD'
 ];
+
+// Crypto: candles from Twelve Data. Key is the bot's pair name, value is Twelve Data's symbol.
+const TWELVE_PAIRS = {
+  BTCUSD: 'BTC/USD',
+  ETHUSD: 'ETH/USD',
+  SOLUSD: 'SOL/USD'
+};
+
+const TARGET_PAIRS = [...DERIV_PAIRS, ...Object.keys(TWELVE_PAIRS)];
+
+// Bot granularity (seconds) -> Twelve Data interval name.
+const TD_INTERVAL = { 300: '5min', 900: '15min', 14400: '4h' };
 
 const TIMEFRAMES = [
   { label: '4H', seconds: 14400, source: 'HTF' },
@@ -92,7 +102,7 @@ function prettyPair(pair) {
 }
 
 function priceDigits(pair, price) {
-  if (pair === 'XAUUSD' || pair.startsWith('BTC') || pair.startsWith('ETH')) return 2;
+  if (['XAUUSD', 'BTCUSD', 'ETHUSD', 'SOLUSD'].includes(pair)) return 2;
   if (pair.endsWith('JPY')) return 3;
   if (price >= 100) return 3;
   if (price >= 10) return 4;
@@ -396,42 +406,102 @@ class DerivSocket {
     }
   }
 
-  // Subscribes one market at a time. A closed or invalid market only affects
-  // itself, so the rest still get live prices.
+  // Subscribes one market at a time. A closed or invalid market only affects itself.
   subscribeTicks(symbols) {
     this.tickSymbols = [...symbols];
     if (!symbols.length) return;
 
-    let ok = 0;
-    let closed = 0;
-    let invalid = 0;
+    (async () => {
+      let ok = 0, closed = 0, invalid = 0, other = 0;
 
-    symbols.forEach((symbol, i) => {
-      setTimeout(() => {
-        this.request({ ticks: symbol, subscribe: 1 })
-          .then(() => { ok++; })
-          .catch(e => {
-            if (/presently closed/i.test(e.message)) closed++;
-            else if (/invalid symbol/i.test(e.message)) {
-              invalid++;
-              log(`Tick subscription rejected for ${symbol}: ${e.message}`);
-            } else {
-              log(`Tick subscription failed for ${symbol}: ${e.message}`);
-            }
-          })
-          .finally(() => {
-            if (i === symbols.length - 1) {
-              setTimeout(() => {
-                log(`Live ticks: ${ok} subscribed, ${closed} closed, ${invalid} invalid.`);
-              }, 2000);
-            }
-          });
-      }, i * TICK_SUBSCRIBE_GAP_MS);
-    });
+      for (const symbol of symbols) {
+        try {
+          await this.request({ ticks: symbol, subscribe: 1 });
+          ok++;
+        } catch (e) {
+          if (/presently closed/i.test(e.message)) closed++;
+          else if (/invalid symbol/i.test(e.message)) {
+            invalid++;
+            log(`Invalid tick symbol sent: "${symbol}"`);
+          } else {
+            other++;
+            log(`Tick error for "${symbol}": ${e.message}`);
+          }
+        }
+        await sleep(TICK_SUBSCRIBE_GAP_MS);
+      }
+
+      log(`Live ticks: ${ok} subscribed, ${closed} closed, ${invalid} invalid, ${other} other.`);
+    })();
   }
 }
 
 const deriv = new DerivSocket();
+
+/* =========================================================
+   TWELVE DATA (crypto candles)
+========================================================= */
+
+// Serialises Twelve Data requests so they never exceed the per-minute limit,
+// even when several scan workers run at once.
+let tdChain = Promise.resolve();
+let tdLastCall = 0;
+
+function tdRequest(url) {
+  const run = tdChain.then(async () => {
+    const wait = TD_GAP_MS - (Date.now() - tdLastCall);
+    if (wait > 0) await sleep(wait);
+    tdLastCall = Date.now();
+    const res = await fetch(url);
+    return res.json();
+  });
+  tdChain = run.catch(() => {});
+  return run;
+}
+
+async function twelveHistory(tdSymbol, interval) {
+  if (!TWELVE_DATA_API_KEY) throw new Error('TWELVE_DATA_API_KEY is not set');
+
+  const params = new URLSearchParams({
+    symbol: tdSymbol,
+    interval,
+    outputsize: '220',
+    timezone: 'UTC',
+    apikey: TWELVE_DATA_API_KEY
+  });
+
+  const data = await tdRequest(`https://api.twelvedata.com/time_series?${params}`);
+
+  if (data.status === 'error' || !Array.isArray(data.values)) {
+    throw new Error(`Twelve Data: ${data.message || 'no values returned'}`);
+  }
+
+  // Twelve Data returns newest first. The bot expects oldest first.
+  return data.values
+    .map(v => ({
+      epoch: Math.floor(Date.parse(String(v.datetime).replace(' ', 'T') + 'Z') / 1000),
+      open: Number(v.open),
+      high: Number(v.high),
+      low: Number(v.low),
+      close: Number(v.close)
+    }))
+    .filter(c => [c.epoch, c.open, c.high, c.low, c.close].every(Number.isFinite))
+    .reverse();
+}
+
+// Returns candles for a pair, from whichever source the pair uses.
+async function getCandles(p, seconds) {
+  if (p.source === 'twelvedata') {
+    const interval = TD_INTERVAL[seconds];
+    if (!interval) throw new Error(`No Twelve Data interval for ${seconds}s`);
+    return twelveHistory(p.symbol, interval);
+  }
+  return deriv.history(p.symbol, seconds);
+}
+
+/* =========================================================
+   TELEGRAM
+========================================================= */
 
 async function sendTelegram(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
@@ -452,6 +522,10 @@ async function sendTelegram(text) {
   if (!response.ok || !body.ok) throw new Error(body.description || `Telegram HTTP ${response.status}`);
   return true;
 }
+
+/* =========================================================
+   ZONE TOUCH, CONFIRMATION, MITIGATION
+========================================================= */
 
 function checkZoneTouches(pair, price) {
   const now = Date.now();
@@ -504,10 +578,10 @@ function checkZoneTouches(pair, price) {
       `Zone source: ${zone.timeframe} ${zone.direction === 'BUY' ? 'DEMAND' : 'SUPPLY'}`,
       `Structure event: ${zone.eventType || 'OB'}${zone.rangeSweep ? ` | ${zone.rangeSweep}` : ''}`,
       `Range position: ${zone.rangePosition || 'UNKNOWN'}`,
-      `Live price at touch: ${fmtPrice(pair, price)}`,
+      `Price at touch: ${fmtPrice(pair, price)}`,
       `Zone: ${fmtPrice(pair, zone.bottom)} – ${fmtPrice(pair, zone.top)}`,
       `Next: waiting for a completed 5M rejection candle.`,
-      `Price source: Deriv`,
+      `Price source: ${pairState.source === 'twelvedata' ? 'Twelve Data' : 'Deriv'}`,
       `⚠️ Warning only; this is not yet a confirmed entry.`
     ].join('\n');
 
@@ -575,7 +649,7 @@ function confirmRejections(pair, candles) {
         `Zone: ${fmtPrice(pair, pending.zoneBottom)} – ${fmtPrice(pair, pending.zoneTop)}`,
         `Structure event: ${pending.eventType || 'OB'} | Range: ${pending.rangePosition || 'UNKNOWN'}`,
         `Confirmation candle: ${new Date(candle.epoch * 1000).toISOString()}`,
-        `Price source: Deriv`,
+        `Price source: ${state.pairs[pair] && state.pairs[pair].source === 'twelvedata' ? 'Twelve Data' : 'Deriv'}`,
         `⚠️ Confirmation is rule-based, not a guarantee of reversal.`
       ].join('\n');
 
@@ -598,21 +672,34 @@ function updateMitigation(pair, price) {
   }
 }
 
-async function resolveSymbols() {
-  const response = await deriv.request({
-    active_symbols: 'brief'
-  });
+/* =========================================================
+   SYMBOL RESOLUTION
+========================================================= */
 
+async function resolveSymbols() {
+  // Crypto pairs use Twelve Data and need no Deriv lookup.
+  for (const [pair, tdSymbol] of Object.entries(TWELVE_PAIRS)) {
+    state.pairs[pair] = {
+      pair,
+      display: prettyPair(pair),
+      source: 'twelvedata',
+      symbol: tdSymbol,
+      status: TWELVE_DATA_API_KEY ? 'Waiting for first scan' : 'Missing TWELVE_DATA_API_KEY',
+      price: null,
+      priceTime: null,
+      lastScan: null,
+      error: ''
+    };
+  }
+
+  // Forex and gold use Deriv.
+  const response = await deriv.request({ active_symbols: 'brief' });
   const symbols = response.active_symbols || [];
   state.activeSymbolsCount = symbols.length;
   log(`Deriv returned ${symbols.length} active symbols.`);
 
   const available = new Map();
-
-  const normalize = value =>
-    String(value || '')
-      .replace(/[^A-Z0-9]/gi, '')
-      .toUpperCase();
+  const normalize = value => String(value || '').replace(/[^A-Z0-9]/gi, '').toUpperCase();
 
   for (const item of symbols) {
     const symbol = String(item.symbol || item.underlying_symbol || '').toUpperCase();
@@ -627,18 +714,19 @@ async function resolveSymbols() {
     const symbolKey = normalize(symbol.replace(/^FRX/, ''));
     const displayKey = normalize(display);
 
-    for (const target of TARGET_PAIRS) {
+    for (const target of DERIV_PAIRS) {
       if (symbolKey === target || displayKey === target) {
         if (!available.has(target)) available.set(target, symbol);
       }
     }
   }
 
-  for (const pair of TARGET_PAIRS) {
+  for (const pair of DERIV_PAIRS) {
     const resolvedSymbol = available.get(pair);
     state.pairs[pair] = {
       pair,
       display: prettyPair(pair),
+      source: 'deriv',
       symbol: resolvedSymbol || null,
       status: resolvedSymbol ? 'Waiting for first scan' : 'Unavailable on Deriv',
       price: null,
@@ -648,35 +736,57 @@ async function resolveSymbols() {
     };
   }
 
-  const resolved = TARGET_PAIRS.filter(pair => state.pairs[pair].symbol);
-  const missing = TARGET_PAIRS.filter(pair => !state.pairs[pair].symbol);
+  const resolvedDeriv = DERIV_PAIRS.filter(pair => state.pairs[pair].symbol);
+  const missing = DERIV_PAIRS.filter(pair => !state.pairs[pair].symbol);
 
-  log(`Deriv resolved ${resolved.length}/${TARGET_PAIRS.length} target markets.`);
+  log(`Deriv resolved ${resolvedDeriv.length}/${DERIV_PAIRS.length} forex/gold markets.`);
   if (missing.length) {
-    log(`Unavailable markets: ${missing.map(prettyPair).join(', ')}`);
+    log(`Unavailable on Deriv: ${missing.map(prettyPair).join(', ')}`);
   }
 
-  if (resolved.length) {
-    deriv.subscribeTicks(resolved.map(pair => state.pairs[pair].symbol));
+  if (resolvedDeriv.length) {
+    deriv.subscribeTicks(resolvedDeriv.map(pair => state.pairs[pair].symbol));
   }
 }
+
+/* =========================================================
+   SCANNING
+========================================================= */
 
 async function scanPair(pair) {
   const p = state.pairs[pair];
   if (!p || !p.symbol) return;
+
+  if (p.source === 'twelvedata' && !TWELVE_DATA_API_KEY) {
+    p.status = 'Missing TWELVE_DATA_API_KEY';
+    return;
+  }
+
   try {
     const allZones = [];
     for (const tf of TIMEFRAMES) {
-      const candles = await deriv.history(p.symbol, tf.seconds);
+      const candles = await getCandles(p, tf.seconds);
       await sleep(REQUEST_GAP_MS);
       allZones.push(...makeZones(pair, tf, candles));
     }
 
-    const candles5m = await deriv.history(p.symbol, 300);
+    const candles5m = await getCandles(p, 300);
     await sleep(REQUEST_GAP_MS);
     const atr5m = calcATR(candles5m);
     if (atr5m) p.atr5m = atr5m;
     confirmRejections(pair, candles5m);
+
+    // Fallback: if no live tick has arrived recently (always the case for
+    // Twelve Data crypto), use the forming 5M candle's close as the current price.
+    const nowSec = Date.now() / 1000;
+    const hasFreshTick = p.priceTime && nowSec - p.priceTime < 600;
+    if (!hasFreshTick && candles5m.length) {
+      const last = candles5m[candles5m.length - 1];
+      p.price = last.close;
+      p.priceTime = last.epoch;
+      checkZoneTouches(pair, last.close);
+      updateMitigation(pair, last.close);
+    }
 
     // Carry over the mitigated flag for zones that were already broken.
     const oldForPair = state.zones.filter(z => z.pair === pair);
@@ -713,7 +823,7 @@ async function runScan() {
       await deriv.connect();
     }
     const pairs = TARGET_PAIRS.filter(pair => state.pairs[pair] && state.pairs[pair].symbol);
-    // Three workers keeps load on the public API reasonable.
+    // Three workers. Twelve Data calls are serialised separately inside tdRequest.
     let cursor = 0;
     const workers = Array.from({ length: 3 }, async () => {
       while (cursor < pairs.length) {
@@ -754,6 +864,10 @@ async function startUp() {
   }, SCAN_INTERVAL_MS);
 }
 
+/* =========================================================
+   WEB SERVER
+========================================================= */
+
 function requireDashboardAuth(req, res, next) {
   if (!DASHBOARD_TOKEN) return next();
   const header = req.headers.authorization || '';
@@ -774,7 +888,6 @@ app.get('/api/status', requireDashboardAuth, (_req, res) => {
     lastError: state.lastError,
     activeSymbolsCount: state.activeSymbolsCount,
     targetPairCount: TARGET_PAIRS.length,
-    targetStocks: STOCKS,
     pairs: Object.values(state.pairs),
     zones: state.zones.slice().sort((a, b) => b.createdAt - a.createdAt),
     structureSummary: state.zones.reduce((acc, z) => {
