@@ -42,6 +42,7 @@
     .buy { color: #25b985; font-weight: bold; }
     .sell { color: #e76a83; font-weight: bold; }
     .muted { color: #93a4bc; }
+    .tf-high { color: #f5c542; font-weight: bold; }
     .signal {
       padding: 12px;
       border: 1px solid #26354b;
@@ -62,7 +63,7 @@
 <main>
   <h1>Deriv Supply &amp; Demand Signal Bot</h1>
   <p class="sub">
-    29 Forex pairs + 4 stock targets · Supply &amp; Demand zones ·
+    Forex, gold and crypto markets · Supply &amp; Demand zones on 5M to 1D ·
     Immediate touch warning + 5-minute rejection confirmation
   </p>
 
@@ -73,7 +74,7 @@
     </div>
     <div class="card">
       <div class="label">Target markets</div>
-      <div class="value" id="targets">33</div>
+      <div class="value" id="targets">—</div>
     </div>
     <div class="card">
       <div class="label">Resolved markets</div>
@@ -96,7 +97,7 @@
         <thead>
           <tr>
             <th>Market</th>
-            <th>Deriv symbol</th>
+            <th>Source symbol</th>
             <th>Price</th>
             <th>Status</th>
           </tr>
@@ -115,6 +116,10 @@
 
   <section>
     <h3>Supply &amp; Demand zones</h3>
+    <p class="muted">
+      Sorted by timeframe (1D first), then by strength. Tested means price has
+      already touched the zone, so it will not alert again.
+    </p>
     <div class="table-wrap">
       <table>
         <thead>
@@ -122,13 +127,14 @@
             <th>Market</th>
             <th>Timeframe</th>
             <th>Direction</th>
+            <th>Strength</th>
             <th>Zone bottom</th>
             <th>Zone top</th>
             <th>Status</th>
           </tr>
         </thead>
         <tbody id="zones">
-          <tr><td colspan="6">Waiting for zones...</td></tr>
+          <tr><td colspan="7">Waiting for zones...</td></tr>
         </tbody>
       </table>
     </div>
@@ -141,101 +147,112 @@
 
   <footer>
     This dashboard displays data supplied by your bot server. It does not
-    generate trading signals independently. Confirm that Deriv market feeds
-    and Telegram delivery work before relying on alerts. Trading involves risk.
+    generate trading signals independently. Confirm that market feeds and
+    Telegram delivery work before relying on alerts. Trading involves risk.
   </footer>
 </main>
 
 <script>
   const el = id => document.getElementById(id);
 
-  function price(value) {
-    if (value === null || value === undefined || !Number.isFinite(Number(value))) {
-      return "—";
-    }
-    return String(Number(value));
+  // Higher timeframes rank first when zones are sorted.
+  const TF_RANK = { '1D': 6, '4H': 5, '1H': 4, '30M': 3, '15M': 2, '5M': 1 };
+
+  function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, ch => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[ch]));
+  }
+
+  // Shows prices with a sensible number of decimals for their size.
+  function price(value, pair) {
+    const n = Number(value);
+    if (value === null || value === undefined || !Number.isFinite(n)) return '—';
+    let digits = 5;
+    if (pair && (pair.endsWith('JPY'))) digits = 3;
+    else if (pair && ['XAUUSD', 'BTCUSD', 'ETHUSD', 'SOLUSD'].includes(pair)) digits = 2;
+    else if (n >= 100) digits = 3;
+    else if (n >= 10) digits = 4;
+    return n.toFixed(digits);
   }
 
   function formatTime(value) {
-    if (!value) return "—";
+    if (!value) return '—';
     const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString();
+    return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString();
+  }
+
+  function sortZones(zones) {
+    return [...zones].sort((a, b) => {
+      const tfDiff = (TF_RANK[b.timeframe] || 0) - (TF_RANK[a.timeframe] || 0);
+      if (tfDiff !== 0) return tfDiff;
+      return (Number(b.score) || 0) - (Number(a.score) || 0);
+    });
   }
 
   async function refreshDashboard() {
     try {
-      const response = await fetch("/api/status", { cache: "no-store" });
-      if (!response.ok) throw new Error("Server returned " + response.status);
+      const response = await fetch('/api/status', { cache: 'no-store' });
+      if (!response.ok) throw new Error('Server returned ' + response.status);
 
       const data = await response.json();
+      const pairs = Array.isArray(data.pairs) ? data.pairs : [];
+      const zones = Array.isArray(data.zones) ? data.zones : [];
+      const signals = Array.isArray(data.signals) ? data.signals : [];
 
-      el("connection").textContent =
-        data.connected ? "Connected" : "Disconnected";
+      el('connection').textContent = data.connected ? 'Connected' : 'Disconnected';
+      el('targets').textContent = data.targetPairCount ?? '—';
+      el('resolved').textContent = pairs.filter(p => p.symbol).length;
+      el('zoneCount').textContent = zones.filter(z => !z.tested).length;
+      el('signalCount').textContent = signals.length;
 
-      el("resolved").textContent =
-        Array.isArray(data.pairs)
-          ? data.pairs.filter(pair => pair.symbol).length
-          : "—";
-
-      el("targets").textContent = data.targetPairCount ?? 33;
-
-      el("zoneCount").textContent =
-        Array.isArray(data.zones)
-          ? data.zones.filter(zone => !zone.mitigated).length
-          : "—";
-
-      el("signalCount").textContent =
-        Array.isArray(data.signals) ? data.signals.length : "—";
-
-      el("pairs").innerHTML = (data.pairs || []).map(pair => `
+      el('pairs').innerHTML = pairs.map(p => `
         <tr>
-          <td>${pair.display || pair.pair || "—"}</td>
-          <td>${pair.symbol || "Unavailable"}</td>
-          <td>${price(pair.price)}</td>
-          <td>${pair.status || "Waiting"}</td>
+          <td>${escapeHtml(p.display || p.pair)}</td>
+          <td>${escapeHtml(p.symbol || 'Unavailable')}</td>
+          <td>${price(p.price, p.pair)}</td>
+          <td>${escapeHtml(p.status || 'Waiting')}</td>
         </tr>
-      `).join("") || '<tr><td colspan="4">No market data available.</td></tr>';
+      `).join('') || '<tr><td colspan="4">No market data available.</td></tr>';
 
-      el("signals").innerHTML = (data.signals || [])
-        .slice(0, 20)
-        .map(signal => `
-          <div class="signal">
-            <strong class="${signal.direction === "BUY" ? "buy" : "sell"}">
-              ${signal.direction || "ALERT"} ${signal.pair || ""}
-            </strong>
-            <p>${signal.alertType || signal.type || "Signal"}</p>
-            <p class="muted">${formatTime(signal.time)}</p>
-            <p>
-              Entry: ${price(signal.entry)} |
-              SL: ${price(signal.sl)} |
-              TP: ${price(signal.tp)}
-            </p>
-          </div>
-        `).join("") || '<p class="muted">No signals yet.</p>';
+      el('signals').innerHTML = signals.slice(0, 20).map(s => `
+        <div class="signal">
+          <strong class="${s.direction === 'BUY' ? 'buy' : 'sell'}">
+            ${escapeHtml(s.direction || 'ALERT')} ${escapeHtml(s.pair || '')}
+          </strong>
+          <p>${escapeHtml(s.type || 'Signal')}${s.timeframe ? ' · ' + escapeHtml(s.timeframe) : ''}</p>
+          <p class="muted">${formatTime(s.time)}</p>
+          <p>
+            Entry: ${price(s.entry, s.pair)} |
+            SL: ${price(s.sl, s.pair)} |
+            TP: ${price(s.tp, s.pair)}
+          </p>
+        </div>
+      `).join('') || '<p class="muted">No signals yet.</p>';
 
-      el("zones").innerHTML = (data.zones || [])
-        .slice(0, 100)
-        .map(zone => `
+      el('zones').innerHTML = sortZones(zones).slice(0, 150).map(z => {
+        const highTf = (TF_RANK[z.timeframe] || 0) >= 4;
+        return `
           <tr>
-            <td>${zone.pair || "—"}</td>
-            <td>${zone.timeframe || "—"}</td>
-            <td class="${zone.direction === "BUY" ? "buy" : "sell"}">
-              ${zone.direction || "—"}
-            </td>
-            <td>${price(zone.bottom)}</td>
-            <td>${price(zone.top)}</td>
-            <td>${zone.mitigated ? "Mitigated" : "Active"}</td>
+            <td>${escapeHtml(z.pair)}</td>
+            <td class="${highTf ? 'tf-high' : ''}">${escapeHtml(z.timeframe)}</td>
+            <td class="${z.direction === 'BUY' ? 'buy' : 'sell'}">${escapeHtml(z.direction)}</td>
+            <td>${z.score != null ? Number(z.score).toFixed(2) + ' ATR' : '—'}</td>
+            <td>${price(z.bottom, z.pair)}</td>
+            <td>${price(z.top, z.pair)}</td>
+            <td>${z.tested ? 'Tested' : 'Active'}</td>
           </tr>
-        `).join("") ||
-        '<tr><td colspan="6">No zones detected yet.</td></tr>';
+        `;
+      }).join('') || '<tr><td colspan="7">No zones detected yet.</td></tr>';
 
-      el("logs").textContent =
-        Array.isArray(data.logs) ? data.logs.join("\n") : "No logs available.";
+      el('logs').textContent = Array.isArray(data.logs)
+        ? data.logs.join('\n')
+        : 'No logs available.';
 
     } catch (error) {
-      el("connection").textContent = "Dashboard error";
-      el("logs").textContent =
-        "Could not load /api/status. Check the server route and Railway logs.\n" +
+      el('connection').textContent = 'Dashboard error';
+      el('logs').textContent =
+        'Could not load /api/status. Check the server route and Railway logs.\n' +
         error.message;
     }
   }
