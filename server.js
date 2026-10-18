@@ -92,10 +92,6 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function normalizePair(value) {
-  return String(value || '').toUpperCase().replace(/[^A-Z]/g, '');
-}
-
 function prettyPair(pair) {
   if (STOCKS.includes(pair)) return pair;
   return pair.length === 6 ? `${pair.slice(0, 3)}/${pair.slice(3)}` : pair;
@@ -702,16 +698,19 @@ async function resolveSymbols() {
   const normalize = value => String(value || '').replace(/[^A-Z0-9]/gi, '').toUpperCase();
 
   for (const item of symbols) {
-    const symbol = String(item.symbol || item.underlying_symbol || '').toUpperCase();
+    // Keep the original case. Deriv symbols are case-sensitive (e.g. frxUSDCAD),
+    // and sending an uppercased name gets "Invalid symbol".
+    const symbol = String(item.symbol || item.underlying_symbol || '');
     const display = String(
       item.display_name || item.underlying_symbol_name || item.name || ''
     ).toUpperCase();
     const submarket = String(item.submarket || '').toLowerCase();
 
     // Skip OTC markets.
-    if (`${symbol} ${display}`.includes('OTC') || submarket.includes('otc')) continue;
+    if (`${symbol} ${display}`.toUpperCase().includes('OTC') || submarket.includes('otc')) continue;
 
-    const symbolKey = normalize(symbol.replace(/^FRX/, ''));
+    // Normalise first (removes non-letters and uppercases), then strip the FRX prefix.
+    const symbolKey = normalize(symbol).replace(/^FRX/, '');
     const displayKey = normalize(display);
 
     for (const target of DERIV_PAIRS) {
