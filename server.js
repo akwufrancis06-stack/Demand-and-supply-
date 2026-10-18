@@ -21,13 +21,48 @@ const REQUEST_GAP_MS = Math.max(100, Number(process.env.REQUEST_GAP_MS || 250));
 const TICK_SUBSCRIBE_GAP_MS = 200;
 // Twelve Data free plan allows 8 requests per minute. 8 seconds between requests stays under that.
 const TD_GAP_MS = 8000;
-const ZONE_LOOKBACK = 160;
-const MAX_ZONES_PER_PAIR_TF = 8;
-const ZONE_TOUCH_COOLDOWN_MS = 30 * 60 * 1000;
 const CONFIRMATION_MAX_AGE_MS = 30 * 60 * 1000;
 const STOCKS = ['AAPL', 'TSLA', 'NVDA', 'AMZN']; // display only; not scanned
 const RR = 2;
 const ATR_PERIOD = 14;
+
+/* =========================================================
+   TIMEFRAMES
+========================================================= */
+
+// Every timeframe a zone can be built from.
+// seconds: Deriv granularity. tdInterval: Twelve Data interval name.
+// maxAgeBars: how many bars old a structure break can be and still make a zone.
+const ZONE_TIMEFRAMES = [
+  { label: '5M',  seconds: 300,   tdInterval: '5min',  maxAgeBars: 288 }, // about 1 day
+  { label: '15M', seconds: 900,   tdInterval: '15min', maxAgeBars: 120 }, // about 30 hours
+  { label: '30M', seconds: 1800,  tdInterval: '30min', maxAgeBars: 96 },  // about 2 days
+  { label: '1H',  seconds: 3600,  tdInterval: '1h',    maxAgeBars: 120 }, // about 5 days
+  { label: '4H',  seconds: 14400, tdInterval: '4h',    maxAgeBars: 60 },  // about 10 days
+  { label: '1D',  seconds: 86400, tdInterval: '1day',  maxAgeBars: 30 }   // about 30 days
+];
+
+// The 5M timeframe is also used for rejection confirmation.
+const TF_5M = ZONE_TIMEFRAMES[0];
+
+/* =========================================================
+   ZONE SETTINGS
+========================================================= */
+
+const ZONE_SETTINGS = {
+  PIVOT_LEFT: 3,               // bars on the left of a swing point
+  PIVOT_RIGHT: 3,              // bars on the right; a swing is only confirmed after these close
+  BREAK_LOOKBACK: 8,           // bars searched backwards for the last opposing candle
+  DISPLACEMENT_BARS: 5,        // bars after the break used to measure the move away
+  MIN_DISPLACEMENT_ATR: 2.5,   // the move away from the zone must be at least this many ATRs
+  MAX_ZONE_HEIGHT_ATR: 2.0,    // wider zones are too loose to be useful
+  MAX_ZONES_PER_TF: 3,         // keeps slower timeframes from being crowded out
+  MAX_ZONES_PER_PAIR: 18       // 3 per timeframe across 6 timeframes
+};
+
+/* =========================================================
+   MARKETS
+========================================================= */
 
 // Forex and gold: resolved from Deriv's active symbols.
 const DERIV_PAIRS = [
@@ -57,13 +92,9 @@ const TWELVE_PAIRS = {
 
 const TARGET_PAIRS = [...DERIV_PAIRS, ...Object.keys(TWELVE_PAIRS)];
 
-// Bot granularity (seconds) -> Twelve Data interval name.
-const TD_INTERVAL = { 300: '5min', 900: '15min', 14400: '4h' };
-
-const TIMEFRAMES = [
-  { label: '4H', seconds: 14400, source: 'HTF' },
-  { label: '15M', seconds: 900, source: 'MTF' }
-];
+/* =========================================================
+   STATE
+========================================================= */
 
 const state = {
   startedAt: new Date().toISOString(),
@@ -79,7 +110,6 @@ const state = {
 };
 
 let scanning = false;
-const lastAlertAt = new Map();
 
 function log(message) {
   const entry = `${new Date().toISOString()} ${message}`;
@@ -91,6 +121,10 @@ function log(message) {
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
+
+/* =========================================================
+   PRICE FORMATTING
+========================================================= */
 
 function prettyPair(pair) {
   if (STOCKS.includes(pair)) return pair;
@@ -105,9 +139,17 @@ function priceDigits(pair, price) {
   return 5;
 }
 
-function fmtPrice(pair, price) {
-  return Number(price).toFixed(priceDigits(pair, Number(price)));
+function roundPrice(pair, value) {
+  return Number(Number(value).toFixed(priceDigits(pair, Number(value))));
 }
+
+function fmtPrice(pair, value) {
+  return Number(value).toFixed(priceDigits(pair, Number(value)));
+}
+
+/* =========================================================
+   INDICATORS
+========================================================= */
 
 function calcATR(candles, period = ATR_PERIOD) {
   if (!Array.isArray(candles) || candles.length < period + 2) return null;
@@ -125,124 +167,140 @@ function calcATR(candles, period = ATR_PERIOD) {
   return slice.reduce((sum, x) => sum + x, 0) / slice.length;
 }
 
-function confirmedPivots(candles, left = 2, right = 2) {
-  const highs = [], lows = [];
-  // A pivot is only accepted after right-side candles have closed.
-  for (let i = left; i < candles.length - right; i++) {
-    let isHigh = true, isLow = true;
-    for (let j = i - left; j <= i + right; j++) {
-      if (j === i) continue;
-      if (candles[j].high >= candles[i].high) isHigh = false;
-      if (candles[j].low <= candles[i].low) isLow = false;
-    }
-    if (isHigh) highs.push({ index: i, price: candles[i].high, epoch: candles[i].epoch });
-    if (isLow) lows.push({ index: i, price: candles[i].low, epoch: candles[i].epoch });
-  }
-  return { highs, lows };
-}
+/* =========================================================
+   ZONE DETECTION
+========================================================= */
 
-function analyseStructure(candles) {
-  const pivots = confirmedPivots(candles);
-  const events = [];
-  let lastHigh = null, lastLow = null, protectedHigh = null, protectedLow = null;
-  let bias = 'NEUTRAL';
-  const seenHighs = new Set(), seenLows = new Set();
-  const byIndex = new Map();
+// Finds closes beyond the last confirmed swing high (bullish break) or
+// swing low (bearish break). Only uses bars that had closed by that point.
+function findStructureBreaks(closed) {
+  const L = ZONE_SETTINGS.PIVOT_LEFT;
+  const R = ZONE_SETTINGS.PIVOT_RIGHT;
+  const breaks = [];
 
-  for (const p of pivots.highs) byIndex.set(p.index, [...(byIndex.get(p.index) || []), { ...p, kind: 'HIGH' }]);
-  for (const p of pivots.lows) byIndex.set(p.index, [...(byIndex.get(p.index) || []), { ...p, kind: 'LOW' }]);
+  let lastHigh = null;
+  let lastLow = null;
+  let highBroken = true;
+  let lowBroken = true;
 
-  for (let i = 0; i < candles.length; i++) {
-    for (const p of (byIndex.get(i) || [])) {
-      if (p.kind === 'HIGH') lastHigh = p;
-      else lastLow = p;
+  for (let i = L + R; i < closed.length; i++) {
+    // The pivot at p = i - R is confirmed now, because R bars have closed after it.
+    const p = i - R;
+    let isHigh = true;
+    let isLow = true;
+    for (let j = p - L; j <= p + R; j++) {
+      if (j === p) continue;
+      if (closed[j].high >= closed[p].high) isHigh = false;
+      if (closed[j].low <= closed[p].low) isLow = false;
     }
-    const c = candles[i];
-    if (lastHigh && c.close > lastHigh.price && !seenHighs.has(lastHigh.index)) {
-      events.push({ index: i, epoch: c.epoch, type: bias === 'SELL' ? 'CHoCH' : 'BOS', direction: 'BUY', level: lastHigh.price, pivotIndex: lastHigh.index });
-      seenHighs.add(lastHigh.index);
-      bias = 'BUY';
-      protectedLow = lastLow;
+    if (isHigh) { lastHigh = { price: closed[p].high }; highBroken = false; }
+    if (isLow) { lastLow = { price: closed[p].low }; lowBroken = false; }
+
+    const c = closed[i];
+    if (lastHigh && !highBroken && c.close > lastHigh.price) {
+      breaks.push({ direction: 'BUY', index: i });
+      highBroken = true;
     }
-    if (lastLow && c.close < lastLow.price && !seenLows.has(lastLow.index)) {
-      events.push({ index: i, epoch: c.epoch, type: bias === 'BUY' ? 'CHoCH' : 'BOS', direction: 'SELL', level: lastLow.price, pivotIndex: lastLow.index });
-      seenLows.add(lastLow.index);
-      bias = 'SELL';
-      protectedHigh = lastHigh;
+    if (lastLow && !lowBroken && c.close < lastLow.price) {
+      breaks.push({ direction: 'SELL', index: i });
+      lowBroken = true;
     }
   }
 
-  const rangeHigh = lastHigh ? lastHigh.price : null;
-  const rangeLow = lastLow ? lastLow.price : null;
-  return { pivots, events, bias, rangeHigh, rangeLow, protectedHigh, protectedLow };
+  return breaks;
 }
 
+// Builds zones from structure breaks. Each zone is the last opposing candle
+// before the break, kept only if price then moved strongly away from it.
 function makeZones(pair, tf, candles) {
-  const result = [];
-  if (!Array.isArray(candles) || candles.length < ATR_PERIOD + 12) return result;
-  const atr = calcATR(candles);
-  if (!atr || !Number.isFinite(atr)) return result;
+  const closed = candles.slice(0, -1); // the last candle is still forming
+  if (closed.length < 40) return [];
 
-  const structure = analyseStructure(candles);
-  const start = Math.max(1, candles.length - ZONE_LOOKBACK);
-  const recentEvents = structure.events.filter(e => e.index >= start && e.index < candles.length - 1);
+  const atr = calcATR(closed);
+  if (!atr) return [];
 
-  // Approximation of the described behavior: confirmed close-based BOS/CHoCH
-  // events create an order block from the nearest opposite-colour candle.
-  // This is not the protected indicator's code and will not match it exactly.
-  for (const event of recentEvents) {
-    const impulse = candles[event.index];
-    const body = Math.abs(impulse.close - impulse.open);
-    if (body < atr * 0.35) continue;
+  const lastIdx = closed.length - 1;
+  const zones = [];
 
-    let sourceIndex = -1;
-    for (let j = event.index - 1; j >= Math.max(0, event.index - 8); j--) {
-      const c = candles[j];
-      const opposite = event.direction === 'BUY' ? c.close < c.open : c.close > c.open;
-      if (opposite) { sourceIndex = j; break; }
+  for (const b of findStructureBreaks(closed)) {
+    if (lastIdx - b.index > tf.maxAgeBars) continue;
+
+    const isBuy = b.direction === 'BUY';
+
+    // Last opposing candle before the break.
+    let srcIdx = -1;
+    for (let j = b.index - 1; j >= Math.max(0, b.index - ZONE_SETTINGS.BREAK_LOOKBACK); j--) {
+      const c = closed[j];
+      const opposing = isBuy ? c.close < c.open : c.close > c.open;
+      if (opposing) { srcIdx = j; break; }
     }
-    if (sourceIndex < 0) continue;
+    if (srcIdx < 0) continue;
 
-    const source = candles[sourceIndex];
-    const top = Math.max(source.open, source.high);
-    const bottom = Math.min(source.open, source.low);
-    if (!(top > bottom)) continue;
+    const source = closed[srcIdx];
+    const top = Math.max(source.open, source.close);
+    const bottom = Math.min(source.open, source.close);
+    const height = top - bottom;
+    if (height < atr * 0.1 || height > atr * ZONE_SETTINGS.MAX_ZONE_HEIGHT_ATR) continue;
 
-    const direction = event.direction;
-    const current = candles[candles.length - 2]; // latest fully closed candle
-    const invalidated = direction === 'BUY' ? current.close < bottom : current.close > top;
-    const rangeHigh = structure.rangeHigh;
-    const rangeLow = structure.rangeLow;
-    const midpoint = Number.isFinite(rangeHigh) && Number.isFinite(rangeLow) ? (rangeHigh + rangeLow) / 2 : null;
-    const rangePosition = midpoint == null ? 'UNKNOWN' : (current.close >= midpoint ? 'PREMIUM' : 'DISCOUNT');
+    // Strong move away: how far price travelled from the zone after the break.
+    const end = Math.min(lastIdx, b.index + ZONE_SETTINGS.DISPLACEMENT_BARS);
+    const windowBars = closed.slice(b.index, end + 1);
+    const move = isBuy
+      ? Math.max(...windowBars.map(c => c.high)) - bottom
+      : top - Math.min(...windowBars.map(c => c.low));
+    const displacement = move / atr;
+    if (displacement < ZONE_SETTINGS.MIN_DISPLACEMENT_ATR) continue;
 
-    result.push({
-      id: `${pair}-${tf.label}-${direction === 'BUY' ? 'D' : 'S'}-${source.epoch}-${event.type}`,
-      pair, timeframe: tf.label, direction, top, bottom,
-      createdAt: source.epoch, eventType: event.type, eventEpoch: event.epoch,
-      breakLevel: event.level, rangeHigh, rangeLow, equilibrium: midpoint,
-      rangePosition, mitigated: invalidated,
-      structureBias: structure.bias, sourceCandleEpoch: source.epoch
+    // Invalidated if a later candle closed through the far side of the zone.
+    const later = closed.slice(srcIdx + 1);
+    const invalidated = later.some(c => isBuy ? c.close < bottom : c.close > top);
+    if (invalidated) continue;
+
+    zones.push({
+      id: `${pair}-${tf.label}-${isBuy ? 'D' : 'S'}-${source.epoch}`,
+      pair,
+      timeframe: tf.label,
+      direction: isBuy ? 'BUY' : 'SELL',
+      top,
+      bottom,
+      createdAt: source.epoch,
+      breakEpoch: closed[b.index].epoch,
+      displacementATR: Number(displacement.toFixed(2)),
+      score: Number(displacement.toFixed(2)),
+      tested: false
     });
   }
 
-  // Annotate sweeps: a wick beyond a structural boundary that closes back inside.
-  const lastClosed = candles[candles.length - 2];
-  for (const z of result) {
-    if (Number.isFinite(z.rangeHigh) && lastClosed.high > z.rangeHigh && lastClosed.close < z.rangeHigh) z.rangeSweep = 'HIGH_SWEEP';
-    else if (Number.isFinite(z.rangeLow) && lastClosed.low < z.rangeLow && lastClosed.close > z.rangeLow) z.rangeSweep = 'LOW_SWEEP';
-    else z.rangeSweep = null;
+  return zones;
+}
+
+// Keeps the strongest zones, limited per timeframe, and drops any zone that
+// overlaps a stronger zone in the same direction.
+function pruneZones(zones) {
+  const sorted = [...zones].sort((a, b) => b.score - a.score);
+  const kept = [];
+  const countByTf = {};
+
+  for (const z of sorted) {
+    if ((countByTf[z.timeframe] || 0) >= ZONE_SETTINGS.MAX_ZONES_PER_TF) continue;
+
+    const overlapsStronger = kept.some(k =>
+      k.direction === z.direction &&
+      z.bottom <= k.top &&
+      z.top >= k.bottom
+    );
+    if (overlapsStronger) continue;
+
+    kept.push(z);
+    countByTf[z.timeframe] = (countByTf[z.timeframe] || 0) + 1;
   }
 
-  // De-duplicate identical zones, keeping the most recent ones.
-  const seen = new Set();
-  return result.reverse().filter(z => {
-    const key = `${z.direction}:${z.top.toFixed(6)}:${z.bottom.toFixed(6)}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  }).reverse().slice(-MAX_ZONES_PER_PAIR_TF);
+  return kept.slice(0, ZONE_SETTINGS.MAX_ZONES_PER_PAIR);
 }
+
+/* =========================================================
+   DERIV SOCKET
+========================================================= */
 
 class DerivSocket {
   constructor() {
@@ -396,8 +454,8 @@ class DerivSocket {
       if (p.symbol !== symbol) continue;
       p.price = quote;
       p.priceTime = Number(tick.epoch || Math.floor(Date.now() / 1000));
+      p.priceSource = 'tick';
       checkZoneTouches(pair, quote);
-      updateMitigation(pair, quote);
       break;
     }
   }
@@ -485,14 +543,12 @@ async function twelveHistory(tdSymbol, interval) {
     .reverse();
 }
 
-// Returns candles for a pair, from whichever source the pair uses.
-async function getCandles(p, seconds) {
+// Returns candles for a pair and timeframe, from whichever source the pair uses.
+async function getCandles(p, tf) {
   if (p.source === 'twelvedata') {
-    const interval = TD_INTERVAL[seconds];
-    if (!interval) throw new Error(`No Twelve Data interval for ${seconds}s`);
-    return twelveHistory(p.symbol, interval);
+    return twelveHistory(p.symbol, tf.tdInterval);
   }
-  return deriv.history(p.symbol, seconds);
+  return deriv.history(p.symbol, tf.seconds);
 }
 
 /* =========================================================
@@ -520,78 +576,102 @@ async function sendTelegram(text) {
 }
 
 /* =========================================================
-   ZONE TOUCH, CONFIRMATION, MITIGATION
+   ZONE TOUCH (immediate warning)
 ========================================================= */
 
+// Alerts once per zone, on its first touch. Overlapping zones touched together
+// produce a single alert for the strongest one.
 function checkZoneTouches(pair, price) {
-  const now = Date.now();
   const pairState = state.pairs[pair];
-  if (!pairState) return;
+  if (!pairState || !Number.isFinite(price)) return;
 
-  for (const zone of state.zones) {
-    if (zone.pair !== pair || zone.mitigated) continue;
-    if (price < zone.bottom || price > zone.top) continue;
+  const touched = state.zones.filter(z =>
+    z.pair === pair && !z.tested && price >= z.bottom && price <= z.top
+  );
+  if (!touched.length) return;
 
-    const cooldownKey = `${zone.id}:${zone.direction}`;
-    const lastAt = lastAlertAt.get(cooldownKey) || 0;
-    if (now - lastAt < ZONE_TOUCH_COOLDOWN_MS) continue;
-    if (state.pendingConfirmations.some(item => item.zoneId === zone.id && !item.completed)) continue;
+  // Every touched zone is now tested, so none of them can alert again.
+  for (const z of touched) z.tested = true;
+  touched.sort((a, b) => b.score - a.score);
+  const zone = touched[0];
 
-    const atr = pairState.atr5m || Math.abs(zone.top - zone.bottom) || price * 0.0005;
-    const buffer = Math.max(atr * 0.15, price * 0.00005);
-    const sl = zone.direction === 'BUY' ? zone.bottom - buffer : zone.top + buffer;
-    const risk = zone.direction === 'BUY' ? price - sl : sl - price;
-    if (risk <= 0) continue;
-    const tp = zone.direction === 'BUY' ? price + RR * risk : price - RR * risk;
+  // Do not stack a second warning while one is still waiting for its 5M confirmation.
+  if (state.pendingConfirmations.some(item =>
+    item.pair === pair && item.direction === zone.direction && !item.completed
+  )) return;
 
-    lastAlertAt.set(cooldownKey, now);
-    zone.alerted = true;
+  const isBuy = zone.direction === 'BUY';
+  const atr = pairState.atr5m || (zone.top - zone.bottom) || price * 0.0005;
+  const buffer = Math.max(atr * 0.15, price * 0.00005);
+  const sl = roundPrice(pair, isBuy ? zone.bottom - buffer : zone.top + buffer);
+  const entry = roundPrice(pair, price);
+  const risk = Math.abs(entry - sl);
+  if (!(risk > 0) || (isBuy ? entry <= sl : entry >= sl)) return;
+  const tp = roundPrice(pair, isBuy ? entry + RR * risk : entry - RR * risk);
 
-    const pending = {
-      id: `${now}-${pair}-${zone.direction}-touch`,
-      zoneId: zone.id,
-      pair, direction: zone.direction, timeframe: zone.timeframe,
-      touchedAt: now, touchPrice: price, zoneTop: zone.top, zoneBottom: zone.bottom,
-      eventType: zone.eventType || 'OB', rangePosition: zone.rangePosition || 'UNKNOWN',
-      sl, tp, completed: false
-    };
-    state.pendingConfirmations.push(pending);
-    state.pendingConfirmations = state.pendingConfirmations
-      .filter(item => now - item.touchedAt < CONFIRMATION_MAX_AGE_MS * 2)
-      .slice(-200);
+  const now = Date.now();
+  const pending = {
+    id: `${now}-${pair}-${zone.direction}-touch`,
+    zoneId: zone.id,
+    pair,
+    direction: zone.direction,
+    timeframe: zone.timeframe,
+    score: zone.score,
+    touchedAt: now,
+    zoneTop: zone.top,
+    zoneBottom: zone.bottom,
+    sl,
+    tp,
+    completed: false
+  };
+  state.pendingConfirmations.push(pending);
+  state.pendingConfirmations = state.pendingConfirmations
+    .filter(item => now - item.touchedAt < CONFIRMATION_MAX_AGE_MS * 2)
+    .slice(-200);
 
-    const signal = {
-      id: pending.id, time: new Date(now).toISOString(), pair,
-      direction: zone.direction, timeframe: zone.timeframe, type: 'ZONE_TOUCH',
-      entry: price, sl, tp, zoneTop: zone.top, zoneBottom: zone.bottom,
-      note: 'Immediate zone-touch warning; wait for separate 5M rejection confirmation.'
-    };
-    state.signals.unshift(signal);
-    state.signals = state.signals.slice(0, 100);
+  state.signals.unshift({
+    id: pending.id,
+    time: new Date(now).toISOString(),
+    pair,
+    direction: zone.direction,
+    timeframe: zone.timeframe,
+    type: 'ZONE_TOUCH',
+    entry,
+    sl,
+    tp,
+    zoneTop: zone.top,
+    zoneBottom: zone.bottom,
+    note: 'First touch of a zone. Wait for a separate 5M rejection confirmation.'
+  });
+  state.signals = state.signals.slice(0, 100);
 
-    const message = [
-      `🔔 ZONE TOUCH — ${zone.direction} ${prettyPair(pair)}`,
-      `Zone source: ${zone.timeframe} ${zone.direction === 'BUY' ? 'DEMAND' : 'SUPPLY'}`,
-      `Structure event: ${zone.eventType || 'OB'}${zone.rangeSweep ? ` | ${zone.rangeSweep}` : ''}`,
-      `Range position: ${zone.rangePosition || 'UNKNOWN'}`,
-      `Price at touch: ${fmtPrice(pair, price)}`,
-      `Zone: ${fmtPrice(pair, zone.bottom)} – ${fmtPrice(pair, zone.top)}`,
-      `Next: waiting for a completed 5M rejection candle.`,
-      `Price source: ${pairState.source === 'twelvedata' ? 'Twelve Data' : 'Deriv'}`,
-      `⚠️ Warning only; this is not yet a confirmed entry.`
-    ].join('\n');
+  const source = pairState.source === 'twelvedata' ? 'Twelve Data' : 'Deriv';
+  const message = [
+    `🔔 ZONE TOUCH — ${zone.direction} ${prettyPair(pair)}`,
+    `Zone: ${zone.timeframe} ${isBuy ? 'DEMAND' : 'SUPPLY'} (strength ${zone.score} ATR)`,
+    `Zone range: ${fmtPrice(pair, zone.bottom)} – ${fmtPrice(pair, zone.top)}`,
+    `Price at touch: ${fmtPrice(pair, entry)}`,
+    `Reference SL: ${fmtPrice(pair, sl)}`,
+    `Reference TP (1:${RR}): ${fmtPrice(pair, tp)}`,
+    touched.length > 1 ? `Also touched: ${touched.length - 1} overlapping zone(s)` : null,
+    `Next: waiting for a completed 5M rejection candle.`,
+    `Price source: ${source}`,
+    `⚠️ Warning only; this is not yet a confirmed entry.`
+  ].filter(Boolean).join('\n');
 
-    sendTelegram(message)
-      .then(ok => log(`${ok ? 'Telegram sent' : 'Signal recorded'}: ZONE TOUCH ${zone.direction} ${pair}`))
-      .catch(err => {
-        log(`Telegram send failed: ${err.message}`);
-        state.lastError = `Telegram: ${err.message}`;
-      });
-  }
+  sendTelegram(message)
+    .then(ok => log(`${ok ? 'Telegram sent' : 'Signal recorded'}: ZONE TOUCH ${zone.direction} ${pair}`))
+    .catch(err => {
+      log(`Telegram send failed: ${err.message}`);
+      state.lastError = `Telegram: ${err.message}`;
+    });
 }
 
-// Checks every closed 5M candle since the touch, not just the latest one.
-// Each pending touch can fire at most one confirmation.
+/* =========================================================
+   5M REJECTION CONFIRMATION
+========================================================= */
+
+// Checks every closed 5M candle since the touch. Each pending touch fires at most once.
 function confirmRejections(pair, candles) {
   if (!Array.isArray(candles) || candles.length < 3) return;
   const now = Date.now();
@@ -618,34 +698,42 @@ function confirmRejections(pair, candles) {
       const bearishReject = pending.direction === 'SELL' && candle.close < candle.open && upperWick / range >= 0.25 && candle.close <= pending.zoneTop;
       if (!bullishReject && !bearishReject) continue;
 
-      const entry = candle.close;
+      const entry = roundPrice(pair, candle.close);
       const risk = pending.direction === 'BUY' ? entry - pending.sl : pending.sl - entry;
       if (risk <= 0) {
         log(`Confirmation skipped: invalid risk for ${pair}`);
         continue;
       }
-      const tp = pending.direction === 'BUY' ? entry + RR * risk : entry - RR * risk;
+      const tp = roundPrice(pair, pending.direction === 'BUY' ? entry + RR * risk : entry - RR * risk);
 
       pending.completed = true;
 
-      const signal = {
-        id: `${pending.id}-confirmed`, time: new Date().toISOString(), pair,
-        direction: pending.direction, timeframe: '5M', type: 'CONFIRMED_ENTRY',
-        entry, sl: pending.sl, tp, zoneTop: pending.zoneTop, zoneBottom: pending.zoneBottom,
-        note: 'Completed 5M rejection candle detected; confirm execution conditions.'
-      };
-      state.signals.unshift(signal);
+      state.signals.unshift({
+        id: `${pending.id}-confirmed`,
+        time: new Date().toISOString(),
+        pair,
+        direction: pending.direction,
+        timeframe: '5M',
+        type: 'CONFIRMED_ENTRY',
+        entry,
+        sl: pending.sl,
+        tp,
+        zoneTop: pending.zoneTop,
+        zoneBottom: pending.zoneBottom,
+        note: 'Completed 5M rejection candle detected. Confirm execution conditions.'
+      });
       state.signals = state.signals.slice(0, 100);
 
+      const source = state.pairs[pair] && state.pairs[pair].source === 'twelvedata' ? 'Twelve Data' : 'Deriv';
       const message = [
         `✅ 5M REJECTION CONFIRMED — ${pending.direction} ${prettyPair(pair)}`,
+        `Zone: ${pending.timeframe} (strength ${pending.score} ATR)`,
         `Reference entry (5M close): ${fmtPrice(pair, entry)}`,
         `Stop Loss: ${fmtPrice(pair, pending.sl)}`,
         `Take Profit (1:${RR}): ${fmtPrice(pair, tp)}`,
-        `Zone: ${fmtPrice(pair, pending.zoneBottom)} – ${fmtPrice(pair, pending.zoneTop)}`,
-        `Structure event: ${pending.eventType || 'OB'} | Range: ${pending.rangePosition || 'UNKNOWN'}`,
+        `Zone range: ${fmtPrice(pair, pending.zoneBottom)} – ${fmtPrice(pair, pending.zoneTop)}`,
         `Confirmation candle: ${new Date(candle.epoch * 1000).toISOString()}`,
-        `Price source: ${state.pairs[pair] && state.pairs[pair].source === 'twelvedata' ? 'Twelve Data' : 'Deriv'}`,
+        `Price source: ${source}`,
         `⚠️ Confirmation is rule-based, not a guarantee of reversal.`
       ].join('\n');
 
@@ -657,14 +745,6 @@ function confirmRejections(pair, candles) {
         });
       break; // one confirmation per pending touch
     }
-  }
-}
-
-function updateMitigation(pair, price) {
-  for (const zone of state.zones) {
-    if (zone.pair !== pair || zone.mitigated) continue;
-    const fullyBroken = zone.direction === 'BUY' ? price < zone.bottom : price > zone.top;
-    if (fullyBroken) zone.mitigated = true;
   }
 }
 
@@ -683,6 +763,7 @@ async function resolveSymbols() {
       status: TWELVE_DATA_API_KEY ? 'Waiting for first scan' : 'Missing TWELVE_DATA_API_KEY',
       price: null,
       priceTime: null,
+      priceSource: null,
       lastScan: null,
       error: ''
     };
@@ -698,8 +779,7 @@ async function resolveSymbols() {
   const normalize = value => String(value || '').replace(/[^A-Z0-9]/gi, '').toUpperCase();
 
   for (const item of symbols) {
-    // Keep the original case. Deriv symbols are case-sensitive (e.g. frxUSDCAD),
-    // and sending an uppercased name gets "Invalid symbol".
+    // Keep the original case. Deriv symbols are case-sensitive (e.g. frxUSDCAD).
     const symbol = String(item.symbol || item.underlying_symbol || '');
     const display = String(
       item.display_name || item.underlying_symbol_name || item.name || ''
@@ -730,6 +810,7 @@ async function resolveSymbols() {
       status: resolvedSymbol ? 'Waiting for first scan' : 'Unavailable on Deriv',
       price: null,
       priceTime: null,
+      priceSource: null,
       lastScan: null,
       error: ''
     };
@@ -762,44 +843,57 @@ async function scanPair(pair) {
   }
 
   try {
-    const allZones = [];
-    for (const tf of TIMEFRAMES) {
-      const candles = await getCandles(p, tf.seconds);
+    // 1. Fetch candles for every timeframe. The 5M set is also used for confirmation.
+    const newZones = [];
+    let candles5m = null;
+
+    for (const tf of ZONE_TIMEFRAMES) {
+      const candles = await getCandles(p, tf);
       await sleep(REQUEST_GAP_MS);
-      allZones.push(...makeZones(pair, tf, candles));
+      if (tf === TF_5M) candles5m = candles;
+      newZones.push(...makeZones(pair, tf, candles));
     }
 
-    const candles5m = await getCandles(p, 300);
-    await sleep(REQUEST_GAP_MS);
-    const atr5m = calcATR(candles5m);
+    if (!candles5m || candles5m.length < 3) throw new Error('Not enough 5M candles');
+
+    const last5 = candles5m[candles5m.length - 1];
+    const atr5m = calcATR(candles5m.slice(0, -1));
     if (atr5m) p.atr5m = atr5m;
     confirmRejections(pair, candles5m);
 
-    // Fallback: if no live tick has arrived recently (always the case for
-    // Twelve Data crypto), use the forming 5M candle's close as the current price.
+    // 2. Decide which price to use for touch checks.
     const nowSec = Date.now() / 1000;
-    const hasFreshTick = p.priceTime && nowSec - p.priceTime < 600;
-    if (!hasFreshTick && candles5m.length) {
-      const last = candles5m[candles5m.length - 1];
-      p.price = last.close;
-      p.priceTime = last.epoch;
-      checkZoneTouches(pair, last.close);
-      updateMitigation(pair, last.close);
-    }
+    const hasFreshTick = p.priceSource === 'tick' && p.priceTime && nowSec - p.priceTime < 600;
+    const refPrice = hasFreshTick ? p.price : last5.close;
 
-    // Carry over the mitigated flag for zones that were already broken.
-    const oldForPair = state.zones.filter(z => z.pair === pair);
-    const newById = new Map(allZones.map(z => [z.id, z]));
-    for (const old of oldForPair) {
-      if (old.mitigated) {
-        const existing = newById.get(old.id);
-        if (existing) existing.mitigated = true;
+    // 3. Keep the strongest zones across all timeframes, then carry over tested state.
+    const previous = new Map(
+      state.zones.filter(z => z.pair === pair).map(z => [z.id, z])
+    );
+    const pruned = pruneZones(newZones);
+
+    for (const z of pruned) {
+      const old = previous.get(z.id);
+      if (old) {
+        z.tested = old.tested;
+      } else if (refPrice >= z.bottom && refPrice <= z.top) {
+        // Already inside when first found: mark silently so it does not alert.
+        z.tested = true;
       }
     }
-    state.zones = state.zones.filter(z => z.pair !== pair).concat(allZones);
-    if (Number.isFinite(p.price)) updateMitigation(pair, p.price);
+
+    state.zones = state.zones.filter(z => z.pair !== pair).concat(pruned);
+
+    // 4. Fallback touch check when no live tick is available (e.g. Twelve Data crypto).
+    if (!hasFreshTick) {
+      p.price = last5.close;
+      p.priceTime = last5.epoch;
+      p.priceSource = 'candle';
+      checkZoneTouches(pair, last5.close);
+    }
 
     p.status = 'Scanning';
+    p.zoneCount = pruned.length;
     p.lastScan = new Date().toISOString();
     p.error = '';
   } catch (err) {
@@ -887,13 +981,9 @@ app.get('/api/status', requireDashboardAuth, (_req, res) => {
     lastError: state.lastError,
     activeSymbolsCount: state.activeSymbolsCount,
     targetPairCount: TARGET_PAIRS.length,
+    timeframes: ZONE_TIMEFRAMES.map(tf => tf.label),
     pairs: Object.values(state.pairs),
     zones: state.zones.slice().sort((a, b) => b.createdAt - a.createdAt),
-    structureSummary: state.zones.reduce((acc, z) => {
-      const key = z.eventType || 'OB';
-      acc[key] = (acc[key] || 0) + 1;
-      return acc;
-    }, {}),
     signals: state.signals,
     logs: state.logs
   });
