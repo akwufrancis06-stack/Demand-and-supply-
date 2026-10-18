@@ -8,8 +8,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = Number(process.env.PORT || 3000);
-const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
-const DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public";
+const DERIV_WS_URL = 'wss://api.derivws.com/trading/v1/options/ws/public';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 // Optional. If set, the dashboard and /api/status require this token.
@@ -18,19 +17,18 @@ const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || '';
 const SCAN_INTERVAL_MS = Math.max(60_000, Number(process.env.SCAN_INTERVAL_MS || 300_000));
 const REQUEST_TIMEOUT_MS = 25_000;
 const REQUEST_GAP_MS = Math.max(100, Number(process.env.REQUEST_GAP_MS || 250));
+const TICK_SUBSCRIBE_GAP_MS = 200;
 const ZONE_LOOKBACK = 160;
 const MAX_ZONES_PER_PAIR_TF = 8;
 const ZONE_TOUCH_COOLDOWN_MS = 30 * 60 * 1000;
 const CONFIRMATION_MAX_AGE_MS = 30 * 60 * 1000;
-const STOCKS = ['AAPL', 'TSLA', 'NVDA', 'AMZN'];
+const STOCKS = ['AAPL', 'TSLA', 'NVDA', 'AMZN']; // kept for display only; not scanned
 const RR = 2;
 const ATR_PERIOD = 14;
 
-// 28 Forex pairs, followed by 4 stock slots.
-// Deriv active_symbols is authoritative; unavailable instruments are skipped.
-
+// Markets the bot tries to resolve on Deriv. Any not listed by Deriv are skipped.
 const TARGET_PAIRS = [
-  // Existing Forex pairs
+  // Forex majors and crosses
   'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'USDCAD',
   'AUDUSD', 'NZDUSD', 'EURGBP', 'EURJPY', 'EURCHF',
   'EURCAD', 'EURAUD', 'EURNZD', 'GBPJPY', 'GBPCHF',
@@ -38,7 +36,7 @@ const TARGET_PAIRS = [
   'AUDCAD', 'AUDNZD', 'NZDJPY', 'NZDCHF', 'NZDCAD',
   'CADJPY', 'CADCHF', 'CHFJPY',
 
-  // Additional Forex pairs
+  // Additional forex
   'USDSGD', 'USDHKD', 'EURSEK', 'EURNOK', 'EURPLN',
   'EURTRY', 'GBPSEK', 'GBPNOK', 'GBPSGD', 'CADSGD',
   'CHFSGD',
@@ -51,7 +49,6 @@ const TARGET_PAIRS = [
   'BNBUSD', 'ADAUSD', 'SOLUSD', 'DOGEUSD', 'DOTUSD',
   'LINKUSD', 'TRXUSD', 'BTCETH'
 ];
-
 
 const TIMEFRAMES = [
   { label: '4H', seconds: 14400, source: 'HTF' },
@@ -94,15 +91,8 @@ function prettyPair(pair) {
   return pair.length === 6 ? `${pair.slice(0, 3)}/${pair.slice(3)}` : pair;
 }
 
-function normalizeStock(value) {
-  const text = String(value || '').toUpperCase();
-  for (const stock of STOCKS) {
-    if (new RegExp(`(^|[^A-Z])${stock}([.]|$|[^A-Z])`).test(text) || text.startsWith(`${stock}.`)) return stock;
-  }
-  return '';
-}
-
 function priceDigits(pair, price) {
+  if (pair === 'XAUUSD' || pair.startsWith('BTC') || pair.startsWith('ETH')) return 2;
   if (pair.endsWith('JPY')) return 3;
   if (price >= 100) return 3;
   if (price >= 10) return 4;
@@ -406,21 +396,38 @@ class DerivSocket {
     }
   }
 
+  // Subscribes one market at a time. A closed or invalid market only affects
+  // itself, so the rest still get live prices.
   subscribeTicks(symbols) {
     this.tickSymbols = [...symbols];
     if (!symbols.length) return;
 
-    this.request({ ticks: symbols, subscribe: 1 })
-      .then(() => log(`Subscribed to live ticks for ${symbols.length} available pairs.`))
-      .catch(err => {
-        log(`Batch tick subscription failed; trying per-symbol subscriptions: ${err.message}`);
-        symbols.forEach((symbol, i) => {
-          setTimeout(() => {
-            this.request({ ticks: symbol, subscribe: 1 })
-              .catch(e => log(`Tick subscription failed for ${symbol}: ${e.message}`));
-          }, i * 150);
-        });
-      });
+    let ok = 0;
+    let closed = 0;
+    let invalid = 0;
+
+    symbols.forEach((symbol, i) => {
+      setTimeout(() => {
+        this.request({ ticks: symbol, subscribe: 1 })
+          .then(() => { ok++; })
+          .catch(e => {
+            if (/presently closed/i.test(e.message)) closed++;
+            else if (/invalid symbol/i.test(e.message)) {
+              invalid++;
+              log(`Tick subscription rejected for ${symbol}: ${e.message}`);
+            } else {
+              log(`Tick subscription failed for ${symbol}: ${e.message}`);
+            }
+          })
+          .finally(() => {
+            if (i === symbols.length - 1) {
+              setTimeout(() => {
+                log(`Live ticks: ${ok} subscribed, ${closed} closed, ${invalid} invalid.`);
+              }, 2000);
+            }
+          });
+      }, i * TICK_SUBSCRIBE_GAP_MS);
+    });
   }
 }
 
@@ -591,24 +598,14 @@ function updateMitigation(pair, price) {
   }
 }
 
-
 async function resolveSymbols() {
   const response = await deriv.request({
     active_symbols: 'brief'
   });
 
   const symbols = response.active_symbols || [];
-  log(`TOTAL DERIV SYMBOLS: ${symbols.length}`);
-
-for (const item of symbols) {
-  const code = item.symbol || item.underlying_symbol || '';
-  const name = item.display_name || item.underlying_symbol_name || item.name || '';
-
-  if (/BTC|ETH|EURNZD|XAU|GOLD/i.test(`${code} ${name}`)) {
-    log(`SYMBOL CHECK: ${code} | ${name}`);
-  }
-}
   state.activeSymbolsCount = symbols.length;
+  log(`Deriv returned ${symbols.length} active symbols.`);
 
   const available = new Map();
 
@@ -618,60 +615,32 @@ for (const item of symbols) {
       .toUpperCase();
 
   for (const item of symbols) {
-    const symbol = String(
-      item.symbol || item.underlying_symbol || ''
-    ).toUpperCase();
-
+    const symbol = String(item.symbol || item.underlying_symbol || '').toUpperCase();
     const display = String(
-      item.display_name ||
-      item.underlying_symbol_name ||
-      item.name ||
-      ''
+      item.display_name || item.underlying_symbol_name || item.name || ''
     ).toUpperCase();
+    const submarket = String(item.submarket || '').toLowerCase();
 
-    const submarket = String(
-      item.submarket || ''
-    ).toLowerCase();
+    // Skip OTC markets.
+    if (`${symbol} ${display}`.includes('OTC') || submarket.includes('otc')) continue;
 
-    const combined = `${symbol} ${display}`;
-
-    // Skip OTC markets
-    if (
-      combined.includes('OTC') ||
-      submarket.includes('otc')
-    ) {
-      continue;
-    }
-
-    // Normalize Deriv symbols and display names
-    const symbolKey = normalize(
-      symbol.replace(/^FRX/, '')
-    );
+    const symbolKey = normalize(symbol.replace(/^FRX/, ''));
     const displayKey = normalize(display);
 
     for (const target of TARGET_PAIRS) {
-      if (
-        symbolKey === target ||
-        displayKey === target
-      ) {
-        if (!available.has(target)) {
-          available.set(target, symbol);
-        }
+      if (symbolKey === target || displayKey === target) {
+        if (!available.has(target)) available.set(target, symbol);
       }
     }
   }
 
-  // Rebuild target market status
   for (const pair of TARGET_PAIRS) {
     const resolvedSymbol = available.get(pair);
-
     state.pairs[pair] = {
       pair,
       display: prettyPair(pair),
       symbol: resolvedSymbol || null,
-      status: resolvedSymbol
-        ? 'Waiting for first scan'
-        : 'Unavailable on Deriv',
+      status: resolvedSymbol ? 'Waiting for first scan' : 'Unavailable on Deriv',
       price: null,
       priceTime: null,
       lastScan: null,
@@ -679,31 +648,18 @@ for (const item of symbols) {
     };
   }
 
-  const resolved = TARGET_PAIRS.filter(
-    pair => state.pairs[pair].symbol
-  );
+  const resolved = TARGET_PAIRS.filter(pair => state.pairs[pair].symbol);
+  const missing = TARGET_PAIRS.filter(pair => !state.pairs[pair].symbol);
 
-  const missing = TARGET_PAIRS.filter(
-    pair => !state.pairs[pair].symbol
-  );
-
-  log(
-    `Deriv resolved ${resolved.length}/${TARGET_PAIRS.length} target markets.`
-  );
-
+  log(`Deriv resolved ${resolved.length}/${TARGET_PAIRS.length} target markets.`);
   if (missing.length) {
-    log(
-      `Unavailable markets: ${missing.map(prettyPair).join(', ')}`
-    );
+    log(`Unavailable markets: ${missing.map(prettyPair).join(', ')}`);
   }
 
   if (resolved.length) {
-    deriv.subscribeTicks(
-      resolved.map(pair => state.pairs[pair].symbol)
-    );
+    deriv.subscribeTicks(resolved.map(pair => state.pairs[pair].symbol));
   }
 }
-
 
 async function scanPair(pair) {
   const p = state.pairs[pair];
@@ -713,10 +669,6 @@ async function scanPair(pair) {
     for (const tf of TIMEFRAMES) {
       const candles = await deriv.history(p.symbol, tf.seconds);
       await sleep(REQUEST_GAP_MS);
-      if (tf.label === '15M') {
-        const atr = calcATR(candles);
-        if (atr) p.atr15m = atr;
-      }
       allZones.push(...makeZones(pair, tf, candles));
     }
 
@@ -771,7 +723,7 @@ async function runScan() {
     });
     await Promise.all(workers);
     state.lastScan = new Date().toISOString();
-    log(`Scan completed. Active configured pairs: ${pairs.length}. Zones tracked: ${state.zones.length}.`);
+    log(`Scan completed. Active configured markets: ${pairs.length}. Zones tracked: ${state.zones.length}.`);
   } catch (err) {
     state.lastError = err.message;
     log(`Scan aborted: ${err.message}`);
@@ -822,7 +774,6 @@ app.get('/api/status', requireDashboardAuth, (_req, res) => {
     lastError: state.lastError,
     activeSymbolsCount: state.activeSymbolsCount,
     targetPairCount: TARGET_PAIRS.length,
-    targetForexCount: TARGET_PAIRS.length - STOCKS.length,
     targetStocks: STOCKS,
     pairs: Object.values(state.pairs),
     zones: state.zones.slice().sort((a, b) => b.createdAt - a.createdAt),
