@@ -101,6 +101,12 @@ const TWELVE_PAIRS = {
 
 const TARGET_PAIRS = [...DERIV_PAIRS, ...Object.keys(TWELVE_PAIRS)];
 
+// Crypto (Twelve Data) limits to stay within the free daily credit limit.
+// 5M is always fetched for crypto because rejection confirmation needs it.
+const CRYPTO_TIMEFRAMES = ['15M', '1H', '4H', '1D'];
+// Crypto is scanned on every 6th cycle: 30 minutes at the default 5-minute interval.
+const CRYPTO_SCAN_EVERY_N = 6;
+
 /* =========================================================
    STATE
 ========================================================= */
@@ -119,6 +125,7 @@ const state = {
 };
 
 let scanning = false;
+let scanCount = 0;
 
 function log(message) {
   const entry = `${new Date().toISOString()} ${message}`;
@@ -934,6 +941,10 @@ async function scanPair(pair) {
     let candles5m = null;
 
     for (const tf of ZONE_TIMEFRAMES) {
+      const isCrypto = p.source === 'twelvedata';
+      const needed = !isCrypto || tf === TF_5M || CRYPTO_TIMEFRAMES.includes(tf.label);
+      if (!needed) continue;
+
       const candles = await getCandles(p, tf);
       await sleep(REQUEST_GAP_MS);
       candlesByLabel[tf.label] = candles;
@@ -1009,7 +1020,15 @@ async function runScan() {
     if (!state.connected) {
       await deriv.connect();
     }
-    const pairs = TARGET_PAIRS.filter(pair => state.pairs[pair] && state.pairs[pair].symbol);
+
+    scanCount++;
+    const runCrypto = scanCount % CRYPTO_SCAN_EVERY_N === 1;
+
+    let pairs = TARGET_PAIRS.filter(pair => state.pairs[pair] && state.pairs[pair].symbol);
+    if (!runCrypto) {
+      pairs = pairs.filter(pair => state.pairs[pair].source !== 'twelvedata');
+    }
+
     // Three workers. Twelve Data calls are serialised separately inside tdRequest.
     let cursor = 0;
     const workers = Array.from({ length: 3 }, async () => {
