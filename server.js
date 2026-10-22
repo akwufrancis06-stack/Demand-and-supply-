@@ -26,11 +26,15 @@ const STOCKS = ['AAPL', 'TSLA', 'NVDA', 'AMZN']; // display only; not scanned
 const RR = 2;
 const ATR_PERIOD = 14;
 
+// Bars downloaded per timeframe. 12H needs about 500 hourly bars;
+// 1W needs about 100 weeks of daily bars.
+const HISTORY_COUNT = 500;
+
 /* =========================================================
    TIMEFRAMES
 ========================================================= */
 
-// Every timeframe a zone can be built from.
+// Timeframes fetched directly from the API.
 // seconds: Deriv granularity. tdInterval: Twelve Data interval name.
 // maxAgeBars: how many bars old a structure break can be and still make a zone.
 const ZONE_TIMEFRAMES = [
@@ -38,9 +42,14 @@ const ZONE_TIMEFRAMES = [
   { label: '15M', seconds: 900,   tdInterval: '15min', maxAgeBars: 120 }, // about 30 hours
   { label: '30M', seconds: 1800,  tdInterval: '30min', maxAgeBars: 96 },  // about 2 days
   { label: '1H',  seconds: 3600,  tdInterval: '1h',    maxAgeBars: 120 }, // about 5 days
+  { label: '2H',  seconds: 7200,  tdInterval: '2h',    maxAgeBars: 60 },  // about 5 days
   { label: '4H',  seconds: 14400, tdInterval: '4h',    maxAgeBars: 60 },  // about 10 days
   { label: '1D',  seconds: 86400, tdInterval: '1day',  maxAgeBars: 30 }   // about 30 days
 ];
+
+// Built from other candles, so not fetched directly.
+const TF_12H = { label: '12H', maxAgeBars: 40 }; // from 1H candles, about 20 days
+const TF_1W = { label: '1W', maxAgeBars: 12 };   // from 1D candles, about 3 months
 
 // The 5M timeframe is also used for rejection confirmation.
 const TF_5M = ZONE_TIMEFRAMES[0];
@@ -57,7 +66,7 @@ const ZONE_SETTINGS = {
   MIN_DISPLACEMENT_ATR: 2.5,   // the move away from the zone must be at least this many ATRs
   MAX_ZONE_HEIGHT_ATR: 2.0,    // wider zones are too loose to be useful
   MAX_ZONES_PER_TF: 3,         // keeps slower timeframes from being crowded out
-  MAX_ZONES_PER_PAIR: 18       // 3 per timeframe across 6 timeframes
+  MAX_ZONES_PER_PAIR: 27       // 3 per timeframe across 9 timeframes
 };
 
 /* =========================================================
@@ -168,6 +177,81 @@ function calcATR(candles, period = ATR_PERIOD) {
 }
 
 /* =========================================================
+   BUILT TIMEFRAMES (12H and 1W)
+========================================================= */
+
+// Builds 12H candles from 1H candles, using 00:00–12:00 and 12:00–24:00 UTC blocks.
+// A block is only used if all 12 hourly candles are present and closed.
+function build12H(candles1H) {
+  // Drop the 1H candle that is still forming, so a block is never built from partial hours.
+  const closed1H = Array.isArray(candles1H) ? candles1H.slice(0, -1) : [];
+  if (closed1H.length < 12) return [];
+
+  const groups = new Map();
+  for (const c of closed1H) {
+    const d = new Date(c.epoch * 1000);
+    const half = d.getUTCHours() < 12 ? 0 : 1;
+    const key = `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}-${half}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(c);
+  }
+
+  const result = [];
+  for (const group of groups.values()) {
+    if (group.length !== 12) continue;
+    group.sort((a, b) => a.epoch - b.epoch);
+    result.push({
+      epoch: group[0].epoch,
+      open: group[0].open,
+      high: Math.max(...group.map(c => c.high)),
+      low: Math.min(...group.map(c => c.low)),
+      close: group[group.length - 1].close
+    });
+  }
+
+  return result.sort((a, b) => a.epoch - b.epoch);
+}
+
+// Start of the Monday (UTC) for the week containing this time, in milliseconds.
+function weekStartMs(ms) {
+  const d = new Date(ms);
+  const daysSinceMonday = (d.getUTCDay() + 6) % 7;
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - daysSinceMonday);
+}
+
+// Builds weekly candles from daily candles. Weeks run Monday to Friday (UTC).
+// The current week is skipped because it is still forming. A week needs at
+// least 4 daily candles, so a holiday week can still count.
+function build1W(candles1D) {
+  if (!Array.isArray(candles1D) || candles1D.length < 4) return [];
+
+  const currentWeek = weekStartMs(Date.now());
+  const groups = new Map();
+
+  for (const c of candles1D) {
+    const key = weekStartMs(c.epoch * 1000);
+    if (key === currentWeek) continue;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(c);
+  }
+
+  const result = [];
+  for (const group of groups.values()) {
+    if (group.length < 4) continue;
+    group.sort((a, b) => a.epoch - b.epoch);
+    result.push({
+      epoch: group[0].epoch,
+      open: group[0].open,
+      high: Math.max(...group.map(c => c.high)),
+      low: Math.min(...group.map(c => c.low)),
+      close: group[group.length - 1].close
+    });
+  }
+
+  return result.sort((a, b) => a.epoch - b.epoch);
+}
+
+/* =========================================================
    ZONE DETECTION
 ========================================================= */
 
@@ -212,8 +296,9 @@ function findStructureBreaks(closed) {
 
 // Builds zones from structure breaks. Each zone is the last opposing candle
 // before the break, kept only if price then moved strongly away from it.
-function makeZones(pair, tf, candles) {
-  const closed = candles.slice(0, -1); // the last candle is still forming
+// lastIsForming: true when the final candle is still open and must be dropped.
+function makeZones(pair, tf, candles, lastIsForming = true) {
+  const closed = lastIsForming ? candles.slice(0, -1) : candles;
   if (closed.length < 40) return [];
 
   const atr = calcATR(closed);
@@ -430,7 +515,7 @@ class DerivSocket {
     const data = await this.request({
       ticks_history: symbol,
       adjust_start_time: 1,
-      count: 220,
+      count: HISTORY_COUNT,
       end: 'latest',
       granularity,
       style: 'candles'
@@ -519,7 +604,7 @@ async function twelveHistory(tdSymbol, interval) {
   const params = new URLSearchParams({
     symbol: tdSymbol,
     interval,
-    outputsize: '220',
+    outputsize: String(HISTORY_COUNT),
     timezone: 'UTC',
     apikey: TWELVE_DATA_API_KEY
   });
@@ -845,14 +930,23 @@ async function scanPair(pair) {
   try {
     // 1. Fetch candles for every timeframe. The 5M set is also used for confirmation.
     const newZones = [];
+    const candlesByLabel = {};
     let candles5m = null;
 
     for (const tf of ZONE_TIMEFRAMES) {
       const candles = await getCandles(p, tf);
       await sleep(REQUEST_GAP_MS);
+      candlesByLabel[tf.label] = candles;
       if (tf === TF_5M) candles5m = candles;
       newZones.push(...makeZones(pair, tf, candles));
     }
+
+    // 2. Built timeframes. Both are made only from closed candles, so none is treated as forming.
+    const candles12h = build12H(candlesByLabel['1H']);
+    newZones.push(...makeZones(pair, TF_12H, candles12h, false));
+
+    const candles1w = build1W(candlesByLabel['1D']);
+    newZones.push(...makeZones(pair, TF_1W, candles1w, false));
 
     if (!candles5m || candles5m.length < 3) throw new Error('Not enough 5M candles');
 
@@ -861,12 +955,12 @@ async function scanPair(pair) {
     if (atr5m) p.atr5m = atr5m;
     confirmRejections(pair, candles5m);
 
-    // 2. Decide which price to use for touch checks.
+    // 3. Decide which price to use for touch checks.
     const nowSec = Date.now() / 1000;
     const hasFreshTick = p.priceSource === 'tick' && p.priceTime && nowSec - p.priceTime < 600;
     const refPrice = hasFreshTick ? p.price : last5.close;
 
-    // 3. Keep the strongest zones across all timeframes, then carry over tested state.
+    // 4. Keep the strongest zones across all timeframes, then carry over tested state.
     const previous = new Map(
       state.zones.filter(z => z.pair === pair).map(z => [z.id, z])
     );
@@ -884,7 +978,7 @@ async function scanPair(pair) {
 
     state.zones = state.zones.filter(z => z.pair !== pair).concat(pruned);
 
-    // 4. Fallback touch check when no live tick is available (e.g. Twelve Data crypto).
+    // 5. Fallback touch check when no live tick is available (e.g. Twelve Data crypto).
     if (!hasFreshTick) {
       p.price = last5.close;
       p.priceTime = last5.epoch;
@@ -981,7 +1075,7 @@ app.get('/api/status', requireDashboardAuth, (_req, res) => {
     lastError: state.lastError,
     activeSymbolsCount: state.activeSymbolsCount,
     targetPairCount: TARGET_PAIRS.length,
-    timeframes: ZONE_TIMEFRAMES.map(tf => tf.label),
+    timeframes: [...ZONE_TIMEFRAMES.map(tf => tf.label), TF_12H.label, TF_1W.label],
     pairs: Object.values(state.pairs),
     zones: state.zones.slice().sort((a, b) => b.createdAt - a.createdAt),
     signals: state.signals,
