@@ -43,6 +43,8 @@
     .sell { color: #e76a83; font-weight: bold; }
     .muted { color: #93a4bc; }
     .tf-high { color: #f5c542; font-weight: bold; }
+    .near { color: #f5c542; font-weight: bold; }
+    .inzone { color: #ff7a59; font-weight: bold; }
     .signal {
       padding: 12px;
       border: 1px solid #26354b;
@@ -85,10 +87,41 @@
       <div class="value" id="zoneCount">—</div>
     </div>
     <div class="card">
+      <div class="label">Approaching now</div>
+      <div class="value" id="approachCount">—</div>
+    </div>
+    <div class="card">
       <div class="label">Recent alerts</div>
       <div class="value" id="signalCount">—</div>
     </div>
   </div>
+
+  <section>
+    <h3>Approaching zones</h3>
+    <p class="muted">
+      Untested zones where price is within <span id="approachPct">0.2</span>% of
+      the zone edge, on the side the trade would come from. Nearest first.
+      "In zone" means price is inside the zone now but has not alerted yet.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Market</th>
+            <th>Timeframe</th>
+            <th>Direction</th>
+            <th>Zone range</th>
+            <th>Distance</th>
+            <th>Price</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="approaching">
+          <tr><td colspan="7">Waiting for zones...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
 
   <section>
     <h3>Market status</h3>
@@ -147,13 +180,19 @@
 
   <footer>
     This dashboard displays data supplied by your bot server. It does not
-    generate trading signals independently. Confirm that market feeds and
-    Telegram delivery work before relying on alerts. Trading involves risk.
+    generate trading signals independently. Crypto prices update only on
+    crypto scans (about every 30 minutes), so crypto distances may be older.
+    Confirm that market feeds and Telegram delivery work before relying on
+    alerts. Trading involves risk.
   </footer>
 </main>
 
 <script>
   const el = id => document.getElementById(id);
+
+  // Show a zone as approaching when price is within this % of its edge.
+  const APPROACH_PCT = 0.2;
+  document.getElementById('approachPct').textContent = APPROACH_PCT;
 
   // Higher timeframes rank first when zones are sorted.
   const TF_RANK = { '1W': 9, '1D': 8, '12H': 7, '4H': 6, '2H': 5, '1H': 4, '30M': 3, '15M': 2, '5M': 1 };
@@ -190,6 +229,31 @@
     });
   }
 
+  // Works out whether price is inside an untested zone or close to its edge,
+  // on the side the trade would come from. Returns null if it is not relevant.
+  function approachInfo(zone, currentPrice) {
+    const price_ = Number(currentPrice);
+    const top = Number(zone.top);
+    const bottom = Number(zone.bottom);
+    if (zone.tested) return null;
+    if (!Number.isFinite(price_) || !Number.isFinite(top) || !Number.isFinite(bottom)) return null;
+
+    if (price_ >= bottom && price_ <= top) {
+      return { status: 'In zone', pct: 0, dist: 0 };
+    }
+
+    let dist = null;
+    // Demand (BUY) zones are approached from above.
+    if (zone.direction === 'BUY' && price_ > top) dist = price_ - top;
+    // Supply (SELL) zones are approached from below.
+    if (zone.direction === 'SELL' && price_ < bottom) dist = bottom - price_;
+    if (dist === null) return null;
+
+    const pct = (dist / price_) * 100;
+    if (pct > APPROACH_PCT) return null;
+    return { status: 'Approaching', pct, dist };
+  }
+
   async function refreshDashboard() {
     try {
       const response = await fetch('/api/status', { cache: 'no-store' });
@@ -200,11 +264,44 @@
       const zones = Array.isArray(data.zones) ? data.zones : [];
       const signals = Array.isArray(data.signals) ? data.signals : [];
 
+      const priceByPair = {};
+      for (const p of pairs) priceByPair[p.pair] = p.price;
+
       el('connection').textContent = data.connected ? 'Connected' : 'Disconnected';
       el('targets').textContent = data.targetPairCount ?? '—';
       el('resolved').textContent = pairs.filter(p => p.symbol).length;
       el('zoneCount').textContent = zones.filter(z => !z.tested).length;
       el('signalCount').textContent = signals.length;
+
+      // Approaching zones: untested zones near price, nearest first.
+      const approaching = zones
+        .map(z => {
+          const info = approachInfo(z, priceByPair[z.pair]);
+          return info ? { zone: z, info } : null;
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.info.pct - b.info.pct);
+
+      el('approachCount').textContent = approaching.length;
+
+      el('approaching').innerHTML = approaching.slice(0, 50).map(({ zone: z, info }) => {
+        const highTf = (TF_RANK[z.timeframe] || 0) >= 4;
+        const statusClass = info.status === 'In zone' ? 'inzone' : 'near';
+        const distanceText = info.status === 'In zone'
+          ? '0%'
+          : info.pct.toFixed(3) + '%';
+        return `
+          <tr>
+            <td>${escapeHtml(z.pair)}</td>
+            <td class="${highTf ? 'tf-high' : ''}">${escapeHtml(z.timeframe)}</td>
+            <td class="${z.direction === 'BUY' ? 'buy' : 'sell'}">${escapeHtml(z.direction)}</td>
+            <td>${price(z.bottom, z.pair)} – ${price(z.top, z.pair)}</td>
+            <td>${distanceText}</td>
+            <td>${price(priceByPair[z.pair], z.pair)}</td>
+            <td class="${statusClass}">${escapeHtml(info.status)}</td>
+          </tr>
+        `;
+      }).join('') || '<tr><td colspan="7">No zones are approaching right now.</td></tr>';
 
       el('pairs').innerHTML = pairs.map(p => `
         <tr>
