@@ -63,7 +63,7 @@
 <main>
   <h1>Deriv Supply &amp; Demand Signal Bot</h1>
   <p class="sub">
-    Forex, gold and crypto markets · Supply &amp; Demand zones on 5M to 1D ·
+    Forex, gold and crypto markets · Supply &amp; Demand zones on 5M to 1W ·
     Immediate touch warning + 5-minute rejection confirmation
   </p>
 
@@ -117,7 +117,7 @@
   <section>
     <h3>Supply &amp; Demand zones</h3>
     <p class="muted">
-      Sorted by timeframe (1D first), then by strength. Tested means price has
+      Sorted by timeframe (1W first), then by strength. Tested means price has
       already touched the zone, so it will not alert again.
     </p>
     <div class="table-wrap">
@@ -156,7 +156,7 @@
   const el = id => document.getElementById(id);
 
   // Higher timeframes rank first when zones are sorted.
-  const TF_RANK = { '1D': 6, '4H': 5, '1H': 4, '30M': 3, '15M': 2, '5M': 1 };
+  const TF_RANK = { '1W': 9, '1D': 8, '12H': 7, '4H': 6, '2H': 5, '1H': 4, '30M': 3, '15M': 2, '5M': 1 };
 
   function escapeHtml(value) {
     return String(value ?? '').replace(/[&<>"']/g, ch => ({
