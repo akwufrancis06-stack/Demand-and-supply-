@@ -26,15 +26,11 @@ const STOCKS = ['AAPL', 'TSLA', 'NVDA', 'AMZN']; // display only; not scanned
 const RR = 2;
 const ATR_PERIOD = 14;
 
-// Bars downloaded per timeframe. 12H needs about 500 hourly bars;
-// 1W needs about 100 weeks of daily bars.
-const HISTORY_COUNT = 500;
-
 /* =========================================================
    TIMEFRAMES
 ========================================================= */
 
-// Timeframes fetched directly from the API.
+// Every timeframe a zone can be built from.
 // seconds: Deriv granularity. tdInterval: Twelve Data interval name.
 // maxAgeBars: how many bars old a structure break can be and still make a zone.
 const ZONE_TIMEFRAMES = [
@@ -42,14 +38,9 @@ const ZONE_TIMEFRAMES = [
   { label: '15M', seconds: 900,   tdInterval: '15min', maxAgeBars: 120 }, // about 30 hours
   { label: '30M', seconds: 1800,  tdInterval: '30min', maxAgeBars: 96 },  // about 2 days
   { label: '1H',  seconds: 3600,  tdInterval: '1h',    maxAgeBars: 120 }, // about 5 days
-  { label: '2H',  seconds: 7200,  tdInterval: '2h',    maxAgeBars: 60 },  // about 5 days
   { label: '4H',  seconds: 14400, tdInterval: '4h',    maxAgeBars: 60 },  // about 10 days
   { label: '1D',  seconds: 86400, tdInterval: '1day',  maxAgeBars: 30 }   // about 30 days
 ];
-
-// Built from other candles, so not fetched directly.
-const TF_12H = { label: '12H', maxAgeBars: 40 }; // from 1H candles, about 20 days
-const TF_1W = { label: '1W', maxAgeBars: 12 };   // from 1D candles, about 3 months
 
 // The 5M timeframe is also used for rejection confirmation.
 const TF_5M = ZONE_TIMEFRAMES[0];
@@ -66,8 +57,13 @@ const ZONE_SETTINGS = {
   MIN_DISPLACEMENT_ATR: 2.5,   // the move away from the zone must be at least this many ATRs
   MAX_ZONE_HEIGHT_ATR: 2.0,    // wider zones are too loose to be useful
   MAX_ZONES_PER_TF: 3,         // keeps slower timeframes from being crowded out
-  MAX_ZONES_PER_PAIR: 27       // 3 per timeframe across 9 timeframes
+  MAX_ZONES_PER_PAIR: 18       // 3 per timeframe across 6 timeframes
 };
+
+// Late-entry protection and scan timing.
+const MAX_CHASE_R = 0.25;                // skip a confirmation if price moved more than 0.25R past entry
+const SCAN_DELAY_AFTER_CLOSE_MS = 5000;  // scan 5 seconds after each 5M candle closes
+const M5_MS = 5 * 60 * 1000;
 
 /* =========================================================
    MARKETS
@@ -101,12 +97,6 @@ const TWELVE_PAIRS = {
 
 const TARGET_PAIRS = [...DERIV_PAIRS, ...Object.keys(TWELVE_PAIRS)];
 
-// Crypto (Twelve Data) limits to stay within the free daily credit limit.
-// 5M is always fetched for crypto because rejection confirmation needs it.
-const CRYPTO_TIMEFRAMES = ['15M', '1H', '4H', '1D'];
-// Crypto is scanned on every 6th cycle: 30 minutes at the default 5-minute interval.
-const CRYPTO_SCAN_EVERY_N = 6;
-
 /* =========================================================
    STATE
 ========================================================= */
@@ -125,7 +115,6 @@ const state = {
 };
 
 let scanning = false;
-let scanCount = 0;
 
 function log(message) {
   const entry = `${new Date().toISOString()} ${message}`;
@@ -184,81 +173,6 @@ function calcATR(candles, period = ATR_PERIOD) {
 }
 
 /* =========================================================
-   BUILT TIMEFRAMES (12H and 1W)
-========================================================= */
-
-// Builds 12H candles from 1H candles, using 00:00–12:00 and 12:00–24:00 UTC blocks.
-// A block is only used if all 12 hourly candles are present and closed.
-function build12H(candles1H) {
-  // Drop the 1H candle that is still forming, so a block is never built from partial hours.
-  const closed1H = Array.isArray(candles1H) ? candles1H.slice(0, -1) : [];
-  if (closed1H.length < 12) return [];
-
-  const groups = new Map();
-  for (const c of closed1H) {
-    const d = new Date(c.epoch * 1000);
-    const half = d.getUTCHours() < 12 ? 0 : 1;
-    const key = `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}-${half}`;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(c);
-  }
-
-  const result = [];
-  for (const group of groups.values()) {
-    if (group.length !== 12) continue;
-    group.sort((a, b) => a.epoch - b.epoch);
-    result.push({
-      epoch: group[0].epoch,
-      open: group[0].open,
-      high: Math.max(...group.map(c => c.high)),
-      low: Math.min(...group.map(c => c.low)),
-      close: group[group.length - 1].close
-    });
-  }
-
-  return result.sort((a, b) => a.epoch - b.epoch);
-}
-
-// Start of the Monday (UTC) for the week containing this time, in milliseconds.
-function weekStartMs(ms) {
-  const d = new Date(ms);
-  const daysSinceMonday = (d.getUTCDay() + 6) % 7;
-  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - daysSinceMonday);
-}
-
-// Builds weekly candles from daily candles. Weeks run Monday to Friday (UTC).
-// The current week is skipped because it is still forming. A week needs at
-// least 4 daily candles, so a holiday week can still count.
-function build1W(candles1D) {
-  if (!Array.isArray(candles1D) || candles1D.length < 4) return [];
-
-  const currentWeek = weekStartMs(Date.now());
-  const groups = new Map();
-
-  for (const c of candles1D) {
-    const key = weekStartMs(c.epoch * 1000);
-    if (key === currentWeek) continue;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(c);
-  }
-
-  const result = [];
-  for (const group of groups.values()) {
-    if (group.length < 4) continue;
-    group.sort((a, b) => a.epoch - b.epoch);
-    result.push({
-      epoch: group[0].epoch,
-      open: group[0].open,
-      high: Math.max(...group.map(c => c.high)),
-      low: Math.min(...group.map(c => c.low)),
-      close: group[group.length - 1].close
-    });
-  }
-
-  return result.sort((a, b) => a.epoch - b.epoch);
-}
-
-/* =========================================================
    ZONE DETECTION
 ========================================================= */
 
@@ -303,9 +217,8 @@ function findStructureBreaks(closed) {
 
 // Builds zones from structure breaks. Each zone is the last opposing candle
 // before the break, kept only if price then moved strongly away from it.
-// lastIsForming: true when the final candle is still open and must be dropped.
-function makeZones(pair, tf, candles, lastIsForming = true) {
-  const closed = lastIsForming ? candles.slice(0, -1) : candles;
+function makeZones(pair, tf, candles) {
+  const closed = candles.slice(0, -1); // the last candle is still forming
   if (closed.length < 40) return [];
 
   const atr = calcATR(closed);
@@ -522,7 +435,7 @@ class DerivSocket {
     const data = await this.request({
       ticks_history: symbol,
       adjust_start_time: 1,
-      count: HISTORY_COUNT,
+      count: 220,
       end: 'latest',
       granularity,
       style: 'candles'
@@ -611,7 +524,7 @@ async function twelveHistory(tdSymbol, interval) {
   const params = new URLSearchParams({
     symbol: tdSymbol,
     interval,
-    outputsize: String(HISTORY_COUNT),
+    outputsize: '220',
     timezone: 'UTC',
     apikey: TWELVE_DATA_API_KEY
   });
@@ -798,6 +711,19 @@ function confirmRejections(pair, candles) {
       }
       const tp = roundPrice(pair, pending.direction === 'BUY' ? entry + RR * risk : entry - RR * risk);
 
+      // Freshness check: the last 5M candle is still forming, so its close is the live price.
+      // Skip the signal if price has already passed the stop or target, or has moved too far past entry.
+      const live = candles[candles.length - 1].close;
+      const sign = pending.direction === 'BUY' ? 1 : -1;
+      const movedR = ((live - entry) * sign) / risk;
+      const throughStop = (live - pending.sl) * sign <= 0;
+      const tpReached = (live - tp) * sign >= 0;
+      if (throughStop || tpReached || movedR > MAX_CHASE_R) {
+        pending.completed = true;
+        log(`Confirmation skipped (late) for ${pair}: live ${fmtPrice(pair, live)}, ${movedR.toFixed(2)}R from entry`);
+        break;
+      }
+
       pending.completed = true;
 
       state.signals.unshift({
@@ -937,27 +863,14 @@ async function scanPair(pair) {
   try {
     // 1. Fetch candles for every timeframe. The 5M set is also used for confirmation.
     const newZones = [];
-    const candlesByLabel = {};
     let candles5m = null;
 
     for (const tf of ZONE_TIMEFRAMES) {
-      const isCrypto = p.source === 'twelvedata';
-      const needed = !isCrypto || tf === TF_5M || CRYPTO_TIMEFRAMES.includes(tf.label);
-      if (!needed) continue;
-
       const candles = await getCandles(p, tf);
       await sleep(REQUEST_GAP_MS);
-      candlesByLabel[tf.label] = candles;
       if (tf === TF_5M) candles5m = candles;
       newZones.push(...makeZones(pair, tf, candles));
     }
-
-    // 2. Built timeframes. Both are made only from closed candles, so none is treated as forming.
-    const candles12h = build12H(candlesByLabel['1H']);
-    newZones.push(...makeZones(pair, TF_12H, candles12h, false));
-
-    const candles1w = build1W(candlesByLabel['1D']);
-    newZones.push(...makeZones(pair, TF_1W, candles1w, false));
 
     if (!candles5m || candles5m.length < 3) throw new Error('Not enough 5M candles');
 
@@ -966,12 +879,12 @@ async function scanPair(pair) {
     if (atr5m) p.atr5m = atr5m;
     confirmRejections(pair, candles5m);
 
-    // 3. Decide which price to use for touch checks.
+    // 2. Decide which price to use for touch checks.
     const nowSec = Date.now() / 1000;
     const hasFreshTick = p.priceSource === 'tick' && p.priceTime && nowSec - p.priceTime < 600;
     const refPrice = hasFreshTick ? p.price : last5.close;
 
-    // 4. Keep the strongest zones across all timeframes, then carry over tested state.
+    // 3. Keep the strongest zones across all timeframes, then carry over tested state.
     const previous = new Map(
       state.zones.filter(z => z.pair === pair).map(z => [z.id, z])
     );
@@ -989,7 +902,7 @@ async function scanPair(pair) {
 
     state.zones = state.zones.filter(z => z.pair !== pair).concat(pruned);
 
-    // 5. Fallback touch check when no live tick is available (e.g. Twelve Data crypto).
+    // 4. Fallback touch check when no live tick is available (e.g. Twelve Data crypto).
     if (!hasFreshTick) {
       p.price = last5.close;
       p.priceTime = last5.epoch;
@@ -1020,15 +933,7 @@ async function runScan() {
     if (!state.connected) {
       await deriv.connect();
     }
-
-    scanCount++;
-    const runCrypto = scanCount % CRYPTO_SCAN_EVERY_N === 1;
-
-    let pairs = TARGET_PAIRS.filter(pair => state.pairs[pair] && state.pairs[pair].symbol);
-    if (!runCrypto) {
-      pairs = pairs.filter(pair => state.pairs[pair].source !== 'twelvedata');
-    }
-
+    const pairs = TARGET_PAIRS.filter(pair => state.pairs[pair] && state.pairs[pair].symbol);
     // Three workers. Twelve Data calls are serialised separately inside tdRequest.
     let cursor = 0;
     const workers = Array.from({ length: 3 }, async () => {
@@ -1048,6 +953,30 @@ async function runScan() {
   }
 }
 
+/* =========================================================
+   SCHEDULER: SCAN JUST AFTER EACH 5M CANDLE CLOSES
+========================================================= */
+
+function msUntilNextScan() {
+  const now = Date.now();
+  // Next 5-minute boundary aligned to UTC, matching Deriv's candle epochs.
+  const nextBoundary = Math.floor(now / M5_MS) * M5_MS + M5_MS;
+  return nextBoundary - now + SCAN_DELAY_AFTER_CLOSE_MS;
+}
+
+function scheduleScan() {
+  const delay = msUntilNextScan();
+  log(`[SCHEDULER] Next scan in ${Math.round(delay / 1000)}s`);
+  setTimeout(() => {
+    runScan()
+      .catch(err => {
+        state.lastError = err.message;
+        log(`Scheduled scan error: ${err.message}`);
+      })
+      .finally(() => scheduleScan());
+  }, delay);
+}
+
 async function startUp() {
   while (true) {
     try {
@@ -1062,12 +991,8 @@ async function startUp() {
   }
 
   await runScan();
-  setInterval(() => {
-    runScan().catch(err => {
-      state.lastError = err.message;
-      log(`Scheduled scan error: ${err.message}`);
-    });
-  }, SCAN_INTERVAL_MS);
+  // Scan just after each 5M candle closes, instead of on a fixed timer from startup.
+  scheduleScan();
 }
 
 /* =========================================================
@@ -1094,7 +1019,7 @@ app.get('/api/status', requireDashboardAuth, (_req, res) => {
     lastError: state.lastError,
     activeSymbolsCount: state.activeSymbolsCount,
     targetPairCount: TARGET_PAIRS.length,
-    timeframes: [...ZONE_TIMEFRAMES.map(tf => tf.label), TF_12H.label, TF_1W.label],
+    timeframes: ZONE_TIMEFRAMES.map(tf => tf.label),
     pairs: Object.values(state.pairs),
     zones: state.zones.slice().sort((a, b) => b.createdAt - a.createdAt),
     signals: state.signals,
