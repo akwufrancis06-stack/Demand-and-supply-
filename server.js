@@ -21,6 +21,12 @@ const REQUEST_GAP_MS = Math.max(100, Number(process.env.REQUEST_GAP_MS || 250));
 const TICK_SUBSCRIBE_GAP_MS = 200;
 // Twelve Data free plan allows 8 requests per minute. 8 seconds between requests stays under that.
 const TD_GAP_MS = 8000;
+// Twelve Data free plan allows 800 credits per day. Stop a little early to keep a safety margin.
+const TD_DAILY_LIMIT = 780;
+// Crypto fetches 5M candles all through this UTC window (your normal strategy). Outside it, 5M is only fetched
+// while a touch is waiting for confirmation. 07:00 to 21:00 UTC costs about 336 credits per pair per day.
+const TD_5M_START_HOUR_UTC = 7;
+const TD_5M_END_HOUR_UTC = 21;
 const CONFIRMATION_MAX_AGE_MS = 30 * 60 * 1000;
 const STOCKS = ['AAPL', 'TSLA', 'NVDA', 'AMZN']; // display only; not scanned
 const RR = 2;
@@ -44,6 +50,8 @@ const ZONE_TIMEFRAMES = [
 
 // The 5M timeframe is also used for rejection confirmation.
 const TF_5M = ZONE_TIMEFRAMES[0];
+// Crypto (Twelve Data) uses 15M for its price check while 5M is not being fetched.
+const TF_15M = ZONE_TIMEFRAMES[1];
 
 /* =========================================================
    ZONE SETTINGS
@@ -86,8 +94,7 @@ const DERIV_PAIRS = [
 // Crypto: candles from Twelve Data. Key is the bot's pair name, value is Twelve Data's symbol.
 const TWELVE_PAIRS = {
   BTCUSD: 'BTC/USD',
-  ETHUSD: 'ETH/USD',
-  SOLUSD: 'SOL/USD'
+  ETHUSD: 'ETH/USD'
 };
 
 const TARGET_PAIRS = [...DERIV_PAIRS, ...Object.keys(TWELVE_PAIRS)];
@@ -132,7 +139,7 @@ function prettyPair(pair) {
 }
 
 function priceDigits(pair, price) {
-  if (['XAUUSD', 'BTCUSD', 'ETHUSD', 'SOLUSD'].includes(pair)) return 2;
+  if (['XAUUSD', 'BTCUSD', 'ETHUSD'].includes(pair)) return 2;
   if (pair.endsWith('JPY')) return 3;
   if (price >= 100) return 3;
   if (price >= 10) return 4;
@@ -501,12 +508,46 @@ const deriv = new DerivSocket();
 let tdChain = Promise.resolve();
 let tdLastCall = 0;
 
+// Credit tracking for the free plan (800 per day, 8 per minute).
+let tdDay = new Date().toISOString().slice(0, 10); // UTC day, same as Twelve Data's daily reset
+let tdDayCount = 0;
+let tdBlockedUntil = 0;
+// Last candles per symbol and interval, so a timeframe is only fetched again after a new candle opens.
+const tdCache = new Map();
+
+// Milliseconds until the start of the next minute, plus a 1 second margin.
+function msToNextMinute() {
+  return 60_000 - (Date.now() % 60_000) + 1000;
+}
+
 function tdRequest(url) {
   const run = tdChain.then(async () => {
+    // Daily credit guard. Counts reset at UTC midnight.
+    const today = new Date().toISOString().slice(0, 10);
+    if (today !== tdDay) {
+      tdDay = today;
+      tdDayCount = 0;
+    }
+    if (tdDayCount >= TD_DAILY_LIMIT) {
+      throw new Error('Twelve Data daily credit limit reached; resumes at 00:00 UTC');
+    }
+
+    // If the per-minute credits ran out, wait for the next minute.
+    const blocked = tdBlockedUntil - Date.now();
+    if (blocked > 0) await sleep(blocked);
+
     const wait = TD_GAP_MS - (Date.now() - tdLastCall);
     if (wait > 0) await sleep(wait);
     tdLastCall = Date.now();
+    tdDayCount++;
     const res = await fetch(url);
+
+    // Twelve Data reports the credits left in the response headers.
+    const left = res.headers.get('api-credits-left');
+    if (left !== null && Number(left) <= 0) {
+      tdBlockedUntil = Date.now() + msToNextMinute();
+    }
+
     return res.json();
   });
   tdChain = run.catch(() => {});
@@ -524,7 +565,15 @@ async function twelveHistory(tdSymbol, interval) {
     apikey: TWELVE_DATA_API_KEY
   });
 
-  const data = await tdRequest(`https://api.twelvedata.com/time_series?${params}`);
+  const url = `https://api.twelvedata.com/time_series?${params}`;
+  let data = await tdRequest(url);
+
+  // Rate limited: wait for the next minute and try once more.
+  if (data && data.code === 429) {
+    log(`Twelve Data rate limit hit for ${tdSymbol} ${interval}; retrying after the next minute starts.`);
+    tdBlockedUntil = Date.now() + msToNextMinute();
+    data = await tdRequest(url);
+  }
 
   if (data.status === 'error' || !Array.isArray(data.values)) {
     throw new Error(`Twelve Data: ${data.message || 'no values returned'}`);
@@ -546,7 +595,15 @@ async function twelveHistory(tdSymbol, interval) {
 // Returns candles for a pair and timeframe, from whichever source the pair uses.
 async function getCandles(p, tf) {
   if (p.source === 'twelvedata') {
-    return twelveHistory(p.symbol, tf.tdInterval);
+    // Only call Twelve Data once per candle period. Between candle closes, reuse the last result.
+    const key = `${p.symbol}|${tf.tdInterval}`;
+    const bucket = Math.floor(Date.now() / (tf.seconds * 1000));
+    const cached = tdCache.get(key);
+    if (cached && cached.bucket === bucket) return cached.candles;
+
+    const candles = await twelveHistory(p.symbol, tf.tdInterval);
+    tdCache.set(key, { bucket, candles });
+    return candles;
   }
   return deriv.history(p.symbol, tf.seconds);
 }
@@ -833,6 +890,20 @@ async function resolveSymbols() {
    SCANNING
 ========================================================= */
 
+// True during the UTC hours when crypto uses the full 5M strategy.
+function in5mWindow() {
+  const hour = new Date().getUTCHours();
+  return hour >= TD_5M_START_HOUR_UTC && hour < TD_5M_END_HOUR_UTC;
+}
+
+// True while a zone touch on this pair is still waiting for its 5M confirmation.
+function hasPendingConfirmation(pair) {
+  const now = Date.now();
+  return state.pendingConfirmations.some(item =>
+    item.pair === pair && !item.completed && now - item.touchedAt <= CONFIRMATION_MAX_AGE_MS
+  );
+}
+
 async function scanPair(pair) {
   const p = state.pairs[pair];
   if (!p || !p.symbol) return;
@@ -846,20 +917,30 @@ async function scanPair(pair) {
     // 1. Fetch candles for every timeframe. The 5M set is also used for confirmation.
     const newZones = [];
     let candles5m = null;
+    let candles15m = null;
 
     for (const tf of ZONE_TIMEFRAMES) {
+      // Crypto (Twelve Data) fetches 5M only inside the trading-hours window, or while a touch is
+      // waiting for confirmation. This saves credits.
+      if (p.source === 'twelvedata' && tf === TF_5M && !in5mWindow() && !hasPendingConfirmation(pair)) continue;
+
       const candles = await getCandles(p, tf);
       await sleep(REQUEST_GAP_MS);
       if (tf === TF_5M) candles5m = candles;
+      if (tf === TF_15M) candles15m = candles;
       newZones.push(...makeZones(pair, tf, candles));
     }
 
-    if (!candles5m || candles5m.length < 3) throw new Error('Not enough 5M candles');
+    // Crypto without 5M data uses the 15M candles for its price check.
+    const priceCandles = candles5m || candles15m;
+    if (!priceCandles || priceCandles.length < 3) throw new Error('Not enough 5M candles');
 
-    const last5 = candles5m[candles5m.length - 1];
-    const atr5m = calcATR(candles5m.slice(0, -1));
-    if (atr5m) p.atr5m = atr5m;
-    confirmRejections(pair, candles5m);
+    const last5 = priceCandles[priceCandles.length - 1];
+    if (candles5m) {
+      const atr5m = calcATR(candles5m.slice(0, -1));
+      if (atr5m) p.atr5m = atr5m;
+      confirmRejections(pair, candles5m);
+    }
 
     // 2. Decide which price to use for touch checks.
     const nowSec = Date.now() / 1000;
