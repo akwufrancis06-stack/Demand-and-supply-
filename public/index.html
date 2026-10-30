@@ -37,6 +37,7 @@
       padding: 11px 8px;
       border-bottom: 1px solid #26354b;
       font-size: 13px;
+      white-space: nowrap;
     }
     th { color: #93a4bc; }
     .buy { color: #25b985; font-weight: bold; }
@@ -45,6 +46,7 @@
     .tf-high { color: #f5c542; font-weight: bold; }
     .near { color: #f5c542; font-weight: bold; }
     .inzone { color: #ff7a59; font-weight: bold; }
+    .stale { color: #ff7a59; font-weight: bold; }
     .signal {
       padding: 12px;
       border: 1px solid #26354b;
@@ -52,6 +54,24 @@
       margin: 10px 0;
       overflow-wrap: anywhere;
     }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      margin: 10px 0;
+      font-size: 13px;
+    }
+    select, button {
+      background: #0b1220;
+      color: #edf3fb;
+      border: 1px solid #26354b;
+      border-radius: 6px;
+      padding: 6px 8px;
+      font-size: 13px;
+    }
+    button { cursor: pointer; }
+    .note { color: #93a4bc; font-size: 12px; line-height: 1.5; }
     pre {
       white-space: pre-wrap;
       overflow-wrap: anywhere;
@@ -93,6 +113,11 @@
     <div class="card">
       <div class="label">Recent alerts</div>
       <div class="value" id="signalCount">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Last updated</div>
+      <div class="value" id="updated">—</div>
+      <div class="label" id="scanText">—</div>
     </div>
   </div>
 
@@ -148,6 +173,89 @@
   </section>
 
   <section>
+    <h3>Signal history with results at 0.1 lot in USD</h3>
+    <p class="note">
+      Saved in this browser, so older signals stay visible after a server restart.
+      Times are shown in your device's time zone. Results are checked against the
+      price this page sees. A move that hits a stop or target and reverses between
+      refreshes can be missed. Crypto results must be checked manually.
+      Dollar values assume <span id="lotSize">0.1</span> lot: forex 1 lot = 100,000 units,
+      XAUUSD 1 lot = 100 oz. Confirm contract sizes with your broker.
+    </p>
+
+    <div class="cards">
+      <div class="card">
+        <div class="label">Confirmed wins</div>
+        <div class="value buy" id="sumWins">0</div>
+      </div>
+      <div class="card">
+        <div class="label">Confirmed losses</div>
+        <div class="value sell" id="sumLosses">0</div>
+      </div>
+      <div class="card">
+        <div class="label">Open or manual</div>
+        <div class="value" id="sumOpen">0</div>
+      </div>
+      <div class="card">
+        <div class="label">Win rate</div>
+        <div class="value" id="sumRate">—</div>
+      </div>
+      <div class="card">
+        <div class="label">Net result at 0.1 lot</div>
+        <div class="value" id="sumNet">—</div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <label>Show
+        <select id="sigFilter">
+          <option value="confirmed">Confirmed entries</option>
+          <option value="touch">Touch warnings</option>
+          <option value="all">All</option>
+        </select>
+      </label>
+      <label>Result
+        <select id="resFilter">
+          <option value="all">All results</option>
+          <option value="win">Wins</option>
+          <option value="loss">Losses</option>
+          <option value="open">Open</option>
+        </select>
+      </label>
+      <label>Sort
+        <select id="sigSort">
+          <option value="tf">Higher timeframe first</option>
+          <option value="time">Newest first</option>
+        </select>
+      </label>
+      <button id="clearHistory" type="button">Clear saved history</button>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Date and time</th>
+            <th>Market</th>
+            <th>Type</th>
+            <th>Zone TF</th>
+            <th>Direction</th>
+            <th>Entry</th>
+            <th>SL</th>
+            <th>TP</th>
+            <th>Risk (SL)</th>
+            <th>Reward (TP)</th>
+            <th>Result</th>
+          </tr>
+        </thead>
+        <tbody id="sigHistory">
+          <tr><td colspan="11">Waiting for signals...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
     <h3>Supply &amp; Demand zones</h3>
     <p class="muted">
       Sorted by timeframe (1W first), then by strength. Tested means price has
@@ -180,10 +288,11 @@
 
   <footer>
     This dashboard displays data supplied by your bot server. It does not
-    generate trading signals independently. Crypto prices update only on
-    crypto scans (about every 30 minutes), so crypto distances may be older.
-    Confirm that market feeds and Telegram delivery work before relying on
-    alerts. Trading involves risk.
+    generate trading signals independently. Results and dollar values are
+    estimates from the prices this page sees, not from your broker's records.
+    Crypto prices update only on crypto scans (about every 30 minutes). Confirm
+    results and contract sizes with your broker. Confirm that market feeds and
+    Telegram delivery work before relying on alerts. Trading involves risk.
   </footer>
 </main>
 
@@ -192,10 +301,24 @@
 
   // Show a zone as approaching when price is within this % of its edge.
   const APPROACH_PCT = 0.2;
-  document.getElementById('approachPct').textContent = APPROACH_PCT;
+
+  // Trade size used for the dollar values in the signal history.
+  const LOT = 0.1;
+  const FX_UNITS_PER_LOT = 100000;
+  const GOLD_OZ_PER_LOT = 100;
+
+  const HISTORY_KEY = 'signalHistory_v1';
+  const HISTORY_MAX = 500;
+  const CRYPTO = ['BTCUSD', 'ETHUSD', 'SOLUSD', 'BTCETH'];
+  const STALE_SCAN_MIN = 15;
 
   // Higher timeframes rank first when zones are sorted.
   const TF_RANK = { '1W': 9, '1D': 8, '12H': 7, '4H': 6, '2H': 5, '1H': 4, '30M': 3, '15M': 2, '5M': 1 };
+
+  let latestPrices = {};
+
+  el('approachPct').textContent = APPROACH_PCT;
+  el('lotSize').textContent = LOT;
 
   function escapeHtml(value) {
     return String(value ?? '').replace(/[&<>"']/g, ch => ({
@@ -208,7 +331,7 @@
     const n = Number(value);
     if (value === null || value === undefined || !Number.isFinite(n)) return '—';
     let digits = 5;
-    if (pair && (pair.endsWith('JPY'))) digits = 3;
+    if (pair && pair.endsWith('JPY')) digits = 3;
     else if (pair && ['XAUUSD', 'BTCUSD', 'ETHUSD', 'SOLUSD'].includes(pair)) digits = 2;
     else if (n >= 100) digits = 3;
     else if (n >= 10) digits = 4;
@@ -254,6 +377,279 @@
     return { status: 'Approaching', pct, dist };
   }
 
+  /* -------------------------------------------------------
+     Dollar values at the chosen lot size
+  ------------------------------------------------------- */
+
+  function isForex(pair) {
+    return /^[A-Z]{6}$/.test(pair) &&
+      !CRYPTO.includes(pair) &&
+      !pair.startsWith('XAU') &&
+      !pair.startsWith('XAG');
+  }
+
+  // How many USD one unit of the quote currency is worth, using the latest prices
+  // the bot reports. Tries a direct pair, an inverse pair, then a EUR cross.
+  function quoteToUsd(quote, prices) {
+    if (quote === 'USD') return 1;
+
+    const direct = prices[quote + 'USD'];
+    if (direct > 0) return direct;
+
+    const inverse = prices['USD' + quote];
+    if (inverse > 0) return 1 / inverse;
+
+    const eurUsd = prices['EURUSD'];
+    const eurQuote = prices['EUR' + quote];
+    if (eurUsd > 0 && eurQuote > 0) return eurUsd / eurQuote;
+
+    return null;
+  }
+
+  // USD value of a price move of `distance` at the chosen lot size.
+  // Returns null when the value cannot be worked out reliably.
+  function dollarsPerPrice(pair, distance, prices) {
+    if (!Number.isFinite(distance)) return null;
+    const d = Math.abs(distance);
+
+    if (pair === 'XAUUSD') return d * GOLD_OZ_PER_LOT * LOT;
+    if (!isForex(pair)) return null;
+
+    const units = LOT * FX_UNITS_PER_LOT;
+    const rate = quoteToUsd(pair.slice(3), prices);
+    if (!rate) return null;
+    return d * units * rate;
+  }
+
+  function usd(value) {
+    return value === null ? 'check broker' : '$' + value.toFixed(2);
+  }
+
+  /* -------------------------------------------------------
+     Results: WIN or LOSS, decided from the price this page sees
+  ------------------------------------------------------- */
+
+  // Only forex and gold are checked automatically. Crypto prices update only
+  // on crypto scans, so a result for crypto must be checked by hand.
+  function isAutoTracked(pair) {
+    return !CRYPTO.includes(pair) && (isForex(pair) || pair === 'XAUUSD');
+  }
+
+  // Marks a signal WIN when price reaches its TP, or LOSS when price reaches
+  // its SL. Once marked, the result is kept and not changed.
+  function updateOutcomes(history, prices) {
+    const nowIso = new Date().toISOString();
+
+    for (const s of history) {
+      if (s.outcome) continue;
+      if (!isAutoTracked(s.pair)) continue;
+
+      const p = Number(prices[s.pair]);
+      const sl = Number(s.sl);
+      const tp = Number(s.tp);
+      if (!Number.isFinite(p) || !Number.isFinite(sl) || !Number.isFinite(tp)) continue;
+
+      const isBuy = s.direction === 'BUY';
+      const tpHit = isBuy ? p >= tp : p <= tp;
+      const slHit = isBuy ? p <= sl : p >= sl;
+
+      if (tpHit) {
+        s.outcome = 'WIN';
+      } else if (slHit) {
+        s.outcome = 'LOSS';
+      } else {
+        continue;
+      }
+
+      s.outcomeTime = nowIso;
+      s.outcomePrice = p;
+    }
+
+    return history;
+  }
+
+  // Dollar result at 0.1 lot: +reward for a WIN, -risk for a LOSS.
+  function resultUsd(s) {
+    if (s.outcome !== 'WIN' && s.outcome !== 'LOSS') return null;
+
+    if (s.outcome === 'WIN') {
+      return dollarsPerPrice(s.pair, Number(s.tp) - Number(s.entry), latestPrices);
+    }
+    const risk = dollarsPerPrice(s.pair, Number(s.entry) - Number(s.sl), latestPrices);
+    return risk === null ? null : -risk;
+  }
+
+  function resultCell(s) {
+    if (s.outcome === 'WIN' || s.outcome === 'LOSS') {
+      const value = resultUsd(s);
+      let amount = 'check broker';
+      if (value !== null) {
+        amount = (value >= 0 ? '+' : '-') + '$' + Math.abs(value).toFixed(2);
+      }
+      const cls = s.outcome === 'WIN' ? 'buy' : 'sell';
+      return `<span class="${cls}">${s.outcome} ${amount}</span><br>` +
+             `<span class="muted">${formatTime(s.outcomeTime)}</span>`;
+    }
+    if (!isAutoTracked(s.pair)) return '<span class="muted">Check manually</span>';
+    return '<span class="muted">Open</span>';
+  }
+
+  function renderSummary(history) {
+    const confirmed = history.filter(s => s.type === 'CONFIRMED_ENTRY');
+    const wins = confirmed.filter(s => s.outcome === 'WIN');
+    const losses = confirmed.filter(s => s.outcome === 'LOSS');
+    const open = confirmed.filter(s => !s.outcome);
+    const decided = wins.length + losses.length;
+
+    let net = 0;
+    let unpriced = 0;
+    for (const s of [...wins, ...losses]) {
+      const value = resultUsd(s);
+      if (value === null) unpriced++;
+      else net += value;
+    }
+
+    el('sumWins').textContent = wins.length;
+    el('sumLosses').textContent = losses.length;
+    el('sumOpen').textContent = open.length;
+    el('sumRate').textContent = decided
+      ? (wins.length / decided * 100).toFixed(1) + '%'
+      : '—';
+    el('sumNet').textContent =
+      (net >= 0 ? '+' : '-') + '$' + Math.abs(net).toFixed(2) +
+      (unpriced ? ` (${unpriced} not priced)` : '');
+  }
+
+  /* -------------------------------------------------------
+     Signal history saved in this browser
+  ------------------------------------------------------- */
+
+  function loadHistory() {
+    try {
+      return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function saveHistory(list) {
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(list));
+    } catch (_) {}
+  }
+
+  // Finds the zone timeframe for a confirmed entry. The server does not send it,
+  // so it is matched by pair, direction and zone edges.
+  function findZoneTf(sig, zones, history) {
+    const fromZones = zones.find(z =>
+      z.pair === sig.pair && z.direction === sig.direction &&
+      Math.abs(z.top - sig.zoneTop) < 1e-9 &&
+      Math.abs(z.bottom - sig.zoneBottom) < 1e-9
+    );
+    if (fromZones) return fromZones.timeframe;
+
+    const touch = history.find(s =>
+      s.type === 'ZONE_TOUCH' && s.pair === sig.pair && s.direction === sig.direction &&
+      Math.abs(s.zoneTop - sig.zoneTop) < 1e-9 &&
+      Math.abs(s.zoneBottom - sig.zoneBottom) < 1e-9
+    );
+    return touch ? touch.zoneTf : null;
+  }
+
+  function mergeSignals(history, incoming, zones) {
+    const byId = new Map(history.map(s => [s.id, s]));
+
+    for (const s of incoming) {
+      // Existing records keep their saved result. Only new signals are added.
+      const existing = byId.get(s.id);
+      const record = existing || {
+        id: s.id,
+        time: s.time,
+        pair: s.pair,
+        direction: s.direction,
+        type: s.type,
+        zoneTf: null,
+        entry: s.entry,
+        sl: s.sl,
+        tp: s.tp,
+        zoneTop: s.zoneTop,
+        zoneBottom: s.zoneBottom
+      };
+
+      if (!record.zoneTf) {
+        record.zoneTf = s.type === 'ZONE_TOUCH'
+          ? s.timeframe
+          : findZoneTf(s, zones, [...byId.values()]);
+      }
+      byId.set(s.id, record);
+    }
+
+    return [...byId.values()]
+      .sort((a, b) => new Date(b.time) - new Date(a.time))
+      .slice(0, HISTORY_MAX);
+  }
+
+  function renderSignalHistory(history) {
+    const showFilter = el('sigFilter').value;
+    const resFilter = el('resFilter').value;
+    const sort = el('sigSort').value;
+
+    const list = history
+      .filter(s => {
+        if (showFilter === 'confirmed') return s.type === 'CONFIRMED_ENTRY';
+        if (showFilter === 'touch') return s.type === 'ZONE_TOUCH';
+        return true;
+      })
+      .filter(s => {
+        if (resFilter === 'win') return s.outcome === 'WIN';
+        if (resFilter === 'loss') return s.outcome === 'LOSS';
+        if (resFilter === 'open') return !s.outcome;
+        return true;
+      })
+      .sort((a, b) => {
+        if (sort === 'tf') {
+          const diff = (TF_RANK[b.zoneTf] || 0) - (TF_RANK[a.zoneTf] || 0);
+          if (diff !== 0) return diff;
+        }
+        return new Date(b.time) - new Date(a.time);
+      });
+
+    el('sigHistory').innerHTML = list.slice(0, 300).map(s => {
+      const riskUsd = dollarsPerPrice(s.pair, Number(s.entry) - Number(s.sl), latestPrices);
+      const rewardUsd = dollarsPerPrice(s.pair, Number(s.tp) - Number(s.entry), latestPrices);
+      const isBuy = s.direction === 'BUY';
+      const highTf = (TF_RANK[s.zoneTf] || 0) >= 4;
+
+      return `
+        <tr>
+          <td>${formatTime(s.time)}</td>
+          <td>${escapeHtml(s.pair)}</td>
+          <td>${s.type === 'CONFIRMED_ENTRY' ? 'Confirmed entry' : 'Touch warning'}</td>
+          <td class="${highTf ? 'tf-high' : ''}">${escapeHtml(s.zoneTf || '—')}</td>
+          <td class="${isBuy ? 'buy' : 'sell'}">${escapeHtml(s.direction)}</td>
+          <td>${price(s.entry, s.pair)}</td>
+          <td>${price(s.sl, s.pair)}</td>
+          <td>${price(s.tp, s.pair)}</td>
+          <td>${usd(riskUsd)}</td>
+          <td>${usd(rewardUsd)}</td>
+          <td>${resultCell(s)}</td>
+        </tr>`;
+    }).join('') || '<tr><td colspan="11">No signals saved yet.</td></tr>';
+  }
+
+  el('sigFilter').addEventListener('change', () => renderSignalHistory(loadHistory()));
+  el('resFilter').addEventListener('change', () => renderSignalHistory(loadHistory()));
+  el('sigSort').addEventListener('change', () => renderSignalHistory(loadHistory()));
+  el('clearHistory').addEventListener('click', () => {
+    localStorage.removeItem(HISTORY_KEY);
+    renderSignalHistory([]);
+    renderSummary([]);
+  });
+
+  /* -------------------------------------------------------
+     Refresh
+  ------------------------------------------------------- */
+
   async function refreshDashboard() {
     try {
       const response = await fetch('/api/status', { cache: 'no-store' });
@@ -265,13 +661,29 @@
       const signals = Array.isArray(data.signals) ? data.signals : [];
 
       const priceByPair = {};
-      for (const p of pairs) priceByPair[p.pair] = p.price;
+      latestPrices = {};
+      for (const p of pairs) {
+        priceByPair[p.pair] = p.price;
+        if (Number.isFinite(Number(p.price))) latestPrices[p.pair] = Number(p.price);
+      }
 
       el('connection').textContent = data.connected ? 'Connected' : 'Disconnected';
       el('targets').textContent = data.targetPairCount ?? '—';
       el('resolved').textContent = pairs.filter(p => p.symbol).length;
       el('zoneCount').textContent = zones.filter(z => !z.tested).length;
       el('signalCount').textContent = signals.length;
+
+      // Last updated time, and a warning if the bot has not scanned recently.
+      el('updated').textContent = new Date().toLocaleTimeString();
+      if (data.lastScan) {
+        const ageMin = (Date.now() - new Date(data.lastScan).getTime()) / 60000;
+        const stale = ageMin > STALE_SCAN_MIN;
+        el('scanText').textContent = `Last scan ${Math.round(ageMin)} min ago`;
+        el('scanText').className = stale ? 'stale' : 'label';
+      } else {
+        el('scanText').textContent = 'No scan yet';
+        el('scanText').className = 'label';
+      }
 
       // Approaching zones: untested zones near price, nearest first.
       const approaching = zones
@@ -327,6 +739,13 @@
         </div>
       `).join('') || '<p class="muted">No signals yet.</p>';
 
+      // Signal history: merge new signals, check results, save, then show.
+      let history = mergeSignals(loadHistory(), signals, zones);
+      history = updateOutcomes(history, latestPrices);
+      saveHistory(history);
+      renderSummary(history);
+      renderSignalHistory(history);
+
       el('zones').innerHTML = sortZones(zones).slice(0, 150).map(z => {
         const highTf = (TF_RANK[z.timeframe] || 0) >= 4;
         return `
@@ -354,6 +773,10 @@
     }
   }
 
+  // Show any saved history straight away, before the first fetch finishes.
+  const savedHistory = loadHistory();
+  renderSummary(savedHistory);
+  renderSignalHistory(savedHistory);
   refreshDashboard();
   setInterval(refreshDashboard, 5000);
 </script>
