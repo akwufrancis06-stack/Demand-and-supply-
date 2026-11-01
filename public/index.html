@@ -44,6 +44,7 @@
     .sell { color: #e76a83; font-weight: bold; }
     .muted { color: #93a4bc; }
     .tf-high { color: #f5c542; font-weight: bold; }
+    .strong { color: #25b985; font-weight: bold; }
     .near { color: #f5c542; font-weight: bold; }
     .inzone { color: #ff7a59; font-weight: bold; }
     .stale { color: #ff7a59; font-weight: bold; }
@@ -105,6 +106,10 @@
     <div class="card">
       <div class="label">Active zones</div>
       <div class="value" id="zoneCount">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Strong zones</div>
+      <div class="value" id="strongCount">—</div>
     </div>
     <div class="card">
       <div class="label">Approaching now</div>
@@ -260,6 +265,9 @@
     <p class="muted">
       Sorted by timeframe (1W first), then by strength. Tested means price has
       already touched the zone, so it will not alert again.
+      <strong>Strong (candle proxy)</strong> means the zone's candles looked forceful:
+      a large source candle, a fast move away from it, and a strong displacement.
+      It is a candle-based estimate, not proof of aggressive buying or selling.
     </p>
     <div class="table-wrap">
       <table>
@@ -269,13 +277,14 @@
             <th>Timeframe</th>
             <th>Direction</th>
             <th>Strength</th>
+            <th>Strength label</th>
             <th>Zone bottom</th>
             <th>Zone top</th>
             <th>Status</th>
           </tr>
         </thead>
         <tbody id="zones">
-          <tr><td colspan="7">Waiting for zones...</td></tr>
+          <tr><td colspan="8">Waiting for zones...</td></tr>
         </tbody>
       </table>
     </div>
@@ -288,11 +297,12 @@
 
   <footer>
     This dashboard displays data supplied by your bot server. It does not
-    generate trading signals independently. Results and dollar values are
-    estimates from the prices this page sees, not from your broker's records.
-    Crypto prices update only on crypto scans (about every 30 minutes). Confirm
-    results and contract sizes with your broker. Confirm that market feeds and
-    Telegram delivery work before relying on alerts. Trading involves risk.
+    generate trading signals independently. Results, dollar values and the
+    strength label are estimates from candle data, not from your broker's
+    records or from order flow. Crypto prices update only on crypto scans
+    (about every 30 minutes). Confirm results and contract sizes with your
+    broker. Confirm that market feeds and Telegram delivery work before relying
+    on alerts. Trading involves risk.
   </footer>
 </main>
 
@@ -306,6 +316,11 @@
   const LOT = 0.1;
   const FX_UNITS_PER_LOT = 100000;
   const GOLD_OZ_PER_LOT = 100;
+
+  // Candle-based "Strong" rules. These are starting values, not tested settings.
+  const STRONG_MIN_SCORE = 4.0;   // displacement in ATR
+  const STRONG_MIN_BODY = 0.8;    // source candle body in ATR
+  const STRONG_MAX_BARS = 3;      // candles from the zone candle to the break
 
   const HISTORY_KEY = 'signalHistory_v1';
   const HISTORY_MAX = 500;
@@ -350,6 +365,21 @@
       if (tfDiff !== 0) return tfDiff;
       return (Number(b.score) || 0) - (Number(a.score) || 0);
     });
+  }
+
+  // Candle-based strength label. Returns "—" for zones that were saved before
+  // the server sent the candle fields.
+  function zoneStrength(z) {
+    const score = Number(z.score);
+    const body = Number(z.sourceBodyAtr);
+    const bars = Number(z.impulseBars);
+    if (!Number.isFinite(score) || !Number.isFinite(body) || !Number.isFinite(bars)) {
+      return { label: '—', cls: 'muted', strong: false };
+    }
+    const strong = score >= STRONG_MIN_SCORE && body >= STRONG_MIN_BODY && bars <= STRONG_MAX_BARS;
+    return strong
+      ? { label: 'Strong (candle proxy)', cls: 'strong', strong: true }
+      : { label: 'Standard', cls: 'muted', strong: false };
   }
 
   // Works out whether price is inside an untested zone or close to its edge,
@@ -671,6 +701,7 @@
       el('targets').textContent = data.targetPairCount ?? '—';
       el('resolved').textContent = pairs.filter(p => p.symbol).length;
       el('zoneCount').textContent = zones.filter(z => !z.tested).length;
+      el('strongCount').textContent = zones.filter(z => !z.tested && zoneStrength(z).strong).length;
       el('signalCount').textContent = signals.length;
 
       // Last updated time, and a warning if the bot has not scanned recently.
@@ -748,18 +779,20 @@
 
       el('zones').innerHTML = sortZones(zones).slice(0, 150).map(z => {
         const highTf = (TF_RANK[z.timeframe] || 0) >= 4;
+        const strength = zoneStrength(z);
         return `
           <tr>
             <td>${escapeHtml(z.pair)}</td>
             <td class="${highTf ? 'tf-high' : ''}">${escapeHtml(z.timeframe)}</td>
             <td class="${z.direction === 'BUY' ? 'buy' : 'sell'}">${escapeHtml(z.direction)}</td>
             <td>${z.score != null ? Number(z.score).toFixed(2) + ' ATR' : '—'}</td>
+            <td class="${strength.cls}">${escapeHtml(strength.label)}</td>
             <td>${price(z.bottom, z.pair)}</td>
             <td>${price(z.top, z.pair)}</td>
             <td>${z.tested ? 'Tested' : 'Active'}</td>
           </tr>
         `;
-      }).join('') || '<tr><td colspan="7">No zones detected yet.</td></tr>';
+      }).join('') || '<tr><td colspan="8">No zones detected yet.</td></tr>';
 
       el('logs').textContent = Array.isArray(data.logs)
         ? data.logs.join('\n')
