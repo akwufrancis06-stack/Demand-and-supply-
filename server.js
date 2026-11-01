@@ -265,8 +265,10 @@ function makeZones(pair, tf, candles) {
       bottom,
       createdAt: source.epoch,
       breakEpoch: closed[b.index].epoch,
-      displacementATR: Number(displacement.toFixed(2)),
+            displacementATR: Number(displacement.toFixed(2)),
       score: Number(displacement.toFixed(2)),
+      sourceBodyAtr: Number((Math.abs(source.close - source.open) / atr).toFixed(2)),
+      impulseBars: b.index - srcIdx,
       tested: false
     });
   }
