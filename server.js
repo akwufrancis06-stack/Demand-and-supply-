@@ -859,6 +859,15 @@ async function scanPair(pair) {
     if (!candles5m || candles5m.length < 3) throw new Error('Not enough 5M candles');
 
     const last5 = candles5m[candles5m.length - 1];
+         // Keep the last 40 closed 5M candles for the dashboard's change-of-character check.
+    // The last candle is still forming, so it is left out.
+    p.recent5m = candles5m.slice(-41, -1).map(c => ({
+      epoch: c.epoch,
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close
+    }));
     const atr5m = calcATR(candles5m.slice(0, -1));
     if (atr5m) p.atr5m = atr5m;
     confirmRejections(pair, candles5m);
