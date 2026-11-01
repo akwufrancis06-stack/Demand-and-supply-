@@ -144,10 +144,11 @@
             <th>Distance</th>
             <th>Price</th>
             <th>Status</th>
+            <th>Strength label</th>
           </tr>
         </thead>
         <tbody id="approaching">
-          <tr><td colspan="7">Waiting for zones...</td></tr>
+          <tr><td colspan="8">Waiting for zones...</td></tr>
         </tbody>
       </table>
     </div>
@@ -291,6 +292,32 @@
   </section>
 
   <section>
+    <h3>Strong vs Standard by timeframe</h3>
+    <p class="muted">
+      Counts of zones from the list above, grouped by timeframe. Strong % shows the
+      share of zones on that timeframe that meet all three Strong rules. Use this
+      to see whether lower or higher timeframes produce more Strong zones.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Timeframe</th>
+            <th>Total zones</th>
+            <th>Strong</th>
+            <th>Standard</th>
+            <th>Strong %</th>
+            <th>Active (untested)</th>
+          </tr>
+        </thead>
+        <tbody id="tfSummary">
+          <tr><td colspan="6">Waiting for zones...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
     <h3>System logs</h3>
     <pre id="logs">Waiting for server...</pre>
   </section>
@@ -329,6 +356,9 @@
 
   // Higher timeframes rank first when zones are sorted.
   const TF_RANK = { '1W': 9, '1D': 8, '12H': 7, '4H': 6, '2H': 5, '1H': 4, '30M': 3, '15M': 2, '5M': 1 };
+
+  // Timeframes shown in the summary table, highest first.
+  const TF_ORDER = ['1W', '1D', '12H', '4H', '2H', '1H', '30M', '15M', '5M'];
 
   let latestPrices = {};
 
@@ -374,12 +404,49 @@
     const body = Number(z.sourceBodyAtr);
     const bars = Number(z.impulseBars);
     if (!Number.isFinite(score) || !Number.isFinite(body) || !Number.isFinite(bars)) {
-      return { label: '—', cls: 'muted', strong: false };
+      return { label: '—', cls: 'muted', strong: false, known: false };
     }
     const strong = score >= STRONG_MIN_SCORE && body >= STRONG_MIN_BODY && bars <= STRONG_MAX_BARS;
     return strong
-      ? { label: 'Strong (candle proxy)', cls: 'strong', strong: true }
-      : { label: 'Standard', cls: 'muted', strong: false };
+      ? { label: 'Strong (candle proxy)', cls: 'strong', strong: true, known: true }
+      : { label: 'Standard', cls: 'muted', strong: false, known: true };
+  }
+
+  // Counts Strong and Standard zones for each timeframe.
+  function renderTimeframeSummary(zones) {
+    const counts = {};
+    for (const tf of TF_ORDER) {
+      counts[tf] = { total: 0, strong: 0, standard: 0, active: 0 };
+    }
+
+    for (const z of zones) {
+      const tf = z.timeframe;
+      if (!counts[tf]) continue;
+      const strength = zoneStrength(z);
+      counts[tf].total++;
+      if (strength.strong) counts[tf].strong++;
+      else if (strength.known) counts[tf].standard++;
+      if (!z.tested) counts[tf].active++;
+    }
+
+    const rows = TF_ORDER.map(tf => {
+      const c = counts[tf];
+      const known = c.strong + c.standard;
+      const strongPct = known ? (c.strong / known * 100).toFixed(0) + '%' : '—';
+      const highTf = (TF_RANK[tf] || 0) >= 4;
+      return `
+        <tr>
+          <td class="${highTf ? 'tf-high' : ''}">${escapeHtml(tf)}</td>
+          <td>${c.total}</td>
+          <td class="strong">${c.strong}</td>
+          <td class="muted">${c.standard}</td>
+          <td>${strongPct}</td>
+          <td>${c.active}</td>
+        </tr>`;
+    });
+
+    el('tfSummary').innerHTML = rows.join('') ||
+      '<tr><td colspan="6">No zones detected yet.</td></tr>';
   }
 
   // Works out whether price is inside an untested zone or close to its edge,
@@ -733,6 +800,7 @@
         const distanceText = info.status === 'In zone'
           ? '0%'
           : info.pct.toFixed(3) + '%';
+        const strength = zoneStrength(z);
         return `
           <tr>
             <td>${escapeHtml(z.pair)}</td>
@@ -742,9 +810,10 @@
             <td>${distanceText}</td>
             <td>${price(priceByPair[z.pair], z.pair)}</td>
             <td class="${statusClass}">${escapeHtml(info.status)}</td>
+            <td class="${strength.cls}">${escapeHtml(strength.label)}</td>
           </tr>
         `;
-      }).join('') || '<tr><td colspan="7">No zones are approaching right now.</td></tr>';
+      }).join('') || '<tr><td colspan="8">No zones are approaching right now.</td></tr>';
 
       el('pairs').innerHTML = pairs.map(p => `
         <tr>
@@ -793,6 +862,8 @@
           </tr>
         `;
       }).join('') || '<tr><td colspan="8">No zones detected yet.</td></tr>';
+
+      renderTimeframeSummary(zones);
 
       el('logs').textContent = Array.isArray(data.logs)
         ? data.logs.join('\n')
