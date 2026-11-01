@@ -454,7 +454,7 @@ class DerivSocket {
     })).filter(c => [c.epoch, c.open, c.high, c.low, c.close].every(Number.isFinite));
   }
 
-    handleTick(tick) {
+      handleTick(tick) {
     const symbol = tick.symbol;
     const quote = Number(tick.quote);
     if (!symbol || !Number.isFinite(quote)) return;
@@ -468,7 +468,6 @@ class DerivSocket {
       p.priceTime = Number(tick.epoch || Math.floor(Date.now() / 1000));
       p.priceSource = 'tick';
       checkZoneTouches(pair, quote);
-      checkTradesWithTick(pair, quote, tickMs);
       updateRejectionChecks(pair, quote, tickMs);
       break;
     }
