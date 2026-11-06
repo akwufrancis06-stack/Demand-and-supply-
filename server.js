@@ -1,6 +1,5 @@
 'use strict';
 
-const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const WebSocket = require('ws');
@@ -23,12 +22,6 @@ const TICK_SUBSCRIBE_GAP_MS = 200;
 // Twelve Data free plan allows 8 requests per minute. 8 seconds between requests stays under that.
 const TD_GAP_MS = 8000;
 const CONFIRMATION_MAX_AGE_MS = 30 * 60 * 1000;
-// 3-minute rejection check on live ticks (forex and gold). Same rule as the 5M check.
-const REJ_BAR_MS = 3 * 60 * 1000;
-const REJ_WINDOW_MS = 30 * 60 * 1000;
-const REJ_WICK = 0.25;
-const MAX_REJECTION_CHECKS = 500;
-const REJECTIONS_FILE = path.join(__dirname, 'rejection_checks.json');
 const STOCKS = ['AAPL', 'TSLA', 'NVDA', 'AMZN']; // display only; not scanned
 const RR = 2;
 const ATR_PERIOD = 14;
@@ -113,7 +106,6 @@ const state = {
   zones: [],
   signals: [],
   pendingConfirmations: [],
-     rejectionChecks: [],
   logs: []
 };
 
@@ -273,10 +265,8 @@ function makeZones(pair, tf, candles) {
       bottom,
       createdAt: source.epoch,
       breakEpoch: closed[b.index].epoch,
-            displacementATR: Number(displacement.toFixed(2)),
+      displacementATR: Number(displacement.toFixed(2)),
       score: Number(displacement.toFixed(2)),
-      sourceBodyAtr: Number((Math.abs(source.close - source.open) / atr).toFixed(2)),
-      impulseBars: b.index - srcIdx,
       tested: false
     });
   }
@@ -454,12 +444,10 @@ class DerivSocket {
     })).filter(c => [c.epoch, c.open, c.high, c.low, c.close].every(Number.isFinite));
   }
 
-      handleTick(tick) {
+  handleTick(tick) {
     const symbol = tick.symbol;
     const quote = Number(tick.quote);
     if (!symbol || !Number.isFinite(quote)) return;
-
-    const tickMs = tick.epoch ? Number(tick.epoch) * 1000 : Date.now();
 
     for (const pair of Object.keys(state.pairs)) {
       const p = state.pairs[pair];
@@ -468,7 +456,6 @@ class DerivSocket {
       p.priceTime = Number(tick.epoch || Math.floor(Date.now() / 1000));
       p.priceSource = 'tick';
       checkZoneTouches(pair, quote);
-      updateRejectionChecks(pair, quote, tickMs);
       break;
     }
   }
@@ -587,146 +574,6 @@ async function sendTelegram(text) {
   if (!response.ok || !body.ok) throw new Error(body.description || `Telegram HTTP ${response.status}`);
   return true;
 }
-/* =========================================================
-   3-MINUTE REJECTION CHECK (live ticks, forex and gold)
-========================================================= */
-
-function loadRejectionChecks() {
-  try {
-    const data = JSON.parse(fs.readFileSync(REJECTIONS_FILE, 'utf8'));
-    if (Array.isArray(data)) state.rejectionChecks = data;
-    log(`Restored ${state.rejectionChecks.length} saved rejection checks.`);
-  } catch (_) {
-    // No file yet, which is normal on the first run.
-  }
-}
-
-function saveRejectionChecks() {
-  try {
-    fs.writeFileSync(REJECTIONS_FILE, JSON.stringify(state.rejectionChecks));
-  } catch (err) {
-    log(`Could not save rejection checks: ${err.message}`);
-  }
-}
-
-// Starts a 3-minute check for a new touch warning.
-function addRejectionCheck(pending) {
-  state.rejectionChecks.push({
-    id: pending.id,
-    pair: pending.pair,
-    direction: pending.direction,
-    zoneTop: pending.zoneTop,
-    zoneBottom: pending.zoneBottom,
-    touchedAt: pending.touchedAt,
-    status: 'PENDING',
-    ticks: 0,
-    bar: null,
-    confirmedAt: null,
-    confirmPrice: null,
-    closedAt: null
-  });
-  state.rejectionChecks = state.rejectionChecks.slice(-MAX_REJECTION_CHECKS);
-  saveRejectionChecks();
-}
-
-// Same rule as the 5M check: overlaps the zone, closes in the trade direction,
-// has a rejection wick of at least 25%, and closes on the zone side.
-function barRejects(b, direction, top, bottom) {
-  if (!(b.low <= top && b.high >= bottom)) return false;
-  const range = Math.max(b.high - b.low, 1e-12);
-  if (direction === 'BUY') {
-    const lowerWick = Math.min(b.open, b.close) - b.low;
-    return b.close > b.open && lowerWick / range >= REJ_WICK && b.close >= bottom;
-  }
-  const upperWick = b.high - Math.max(b.open, b.close);
-  return b.close < b.open && upperWick / range >= REJ_WICK && b.close <= top;
-}
-
-// Judges one finished 3-minute bar. Returns true when the check is decided.
-function applyBar(check, b) {
-  const closeMs = b.start + REJ_BAR_MS;
-  if (barRejects(b, check.direction, check.zoneTop, check.zoneBottom)) {
-    check.status = 'CONFIRMED';
-    check.confirmedAt = closeMs;
-    check.confirmPrice = b.close;
-    return true;
-  }
-  const beyond = check.direction === 'BUY'
-    ? b.close < check.zoneBottom
-    : b.close > check.zoneTop;
-  if (beyond) {
-    check.status = 'FAILED';
-    check.closedAt = closeMs;
-    return true;
-  }
-  return false;
-}
-
-// Closes a check when its window ends. Judges the last finished bar first.
-function finalizeRejectionCheck(check) {
-  const windowEnd = check.touchedAt + REJ_WINDOW_MS;
-  if (check.bar && check.bar.start + REJ_BAR_MS <= windowEnd) {
-    applyBar(check, check.bar);
-  }
-  if (check.status === 'PENDING') {
-    check.status = check.ticks === 0 ? 'NO_DATA' : 'NO_CONFIRM';
-    check.closedAt = windowEnd;
-  }
-  check.bar = null;
-}
-
-// Called on every live tick. Builds 3-minute bars from ticks after the touch.
-function updateRejectionChecks(pair, price, tickMs) {
-  let changed = false;
-
-  for (const check of state.rejectionChecks) {
-    if (check.pair !== pair || check.status !== 'PENDING') continue;
-    if (tickMs < check.touchedAt) continue;
-
-    if (tickMs >= check.touchedAt + REJ_WINDOW_MS) {
-      finalizeRejectionCheck(check);
-      changed = true;
-      continue;
-    }
-
-    check.ticks = (check.ticks || 0) + 1;
-
-    const start = Math.floor(tickMs / REJ_BAR_MS) * REJ_BAR_MS;
-    // Only bars that start at or after the touch count.
-    if (start < check.touchedAt) continue;
-
-    if (check.bar && check.bar.start === start) {
-      check.bar.high = Math.max(check.bar.high, price);
-      check.bar.low = Math.min(check.bar.low, price);
-      check.bar.close = price;
-      continue;
-    }
-
-    // A new bar started, so the previous bar is complete and can be judged.
-    if (check.bar && applyBar(check, check.bar)) {
-      check.bar = null;
-      changed = true;
-      continue;
-    }
-    check.bar = { start, open: price, high: price, low: price, close: price };
-  }
-
-  if (changed) saveRejectionChecks();
-}
-
-// Closes checks whose window has passed. Runs after each scan, so checks
-// finish even when no ticks arrive (for example, on weekends).
-function expireRejectionChecks() {
-  const now = Date.now();
-  let changed = false;
-  for (const check of state.rejectionChecks) {
-    if (check.status !== 'PENDING') continue;
-    if (now < check.touchedAt + REJ_WINDOW_MS) continue;
-    finalizeRejectionCheck(check);
-    changed = true;
-  }
-  if (changed) saveRejectionChecks();
-}
 
 /* =========================================================
    ZONE TOUCH (immediate warning)
@@ -798,9 +645,7 @@ function checkZoneTouches(pair, price) {
   });
   state.signals = state.signals.slice(0, 100);
 
-    // Start the 3-minute check only for live-tick touches (forex and gold).
-  if (pairState.priceSource === 'tick') addRejectionCheck(pending);
-   const source = pairState.source === 'twelvedata' ? 'Twelve Data' : 'Deriv';
+  const source = pairState.source === 'twelvedata' ? 'Twelve Data' : 'Deriv';
   const message = [
     `🔔 ZONE TOUCH — ${zone.direction} ${prettyPair(pair)}`,
     `Zone: ${zone.timeframe} ${isBuy ? 'DEMAND' : 'SUPPLY'} (strength ${zone.score} ATR)`,
@@ -1012,15 +857,6 @@ async function scanPair(pair) {
     if (!candles5m || candles5m.length < 3) throw new Error('Not enough 5M candles');
 
     const last5 = candles5m[candles5m.length - 1];
-         // Keep the last 40 closed 5M candles for the dashboard's change-of-character check.
-    // The last candle is still forming, so it is left out.
-    p.recent5m = candles5m.slice(-41, -1).map(c => ({
-      epoch: c.epoch,
-      open: c.open,
-      high: c.high,
-      low: c.low,
-      close: c.close
-    }));
     const atr5m = calcATR(candles5m.slice(0, -1));
     if (atr5m) p.atr5m = atr5m;
     confirmRejections(pair, candles5m);
@@ -1089,7 +925,6 @@ async function runScan() {
       }
     });
     await Promise.all(workers);
-         expireRejectionChecks();
     state.lastScan = new Date().toISOString();
     log(`Scan completed. Active configured markets: ${pairs.length}. Zones tracked: ${state.zones.length}.`);
   } catch (err) {
@@ -1150,7 +985,6 @@ app.get('/api/status', requireDashboardAuth, (_req, res) => {
     pairs: Object.values(state.pairs),
     zones: state.zones.slice().sort((a, b) => b.createdAt - a.createdAt),
     signals: state.signals,
-         rejectionChecks: state.rejectionChecks.slice().sort((a, b) => b.touchedAt - a.touchedAt).slice(0, 200),
     logs: state.logs
   });
 });
@@ -1160,6 +994,5 @@ app.get('/health', (_req, res) => res.json({ ok: true, connected: state.connecte
 
 app.listen(PORT, () => {
   log(`Dashboard listening on port ${PORT}`);
-     loadRejectionChecks();
   startUp();
 });
