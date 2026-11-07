@@ -80,6 +80,16 @@ const CRT_AT_ZONE = String(process.env.CRT_AT_ZONE || 'true').toLowerCase() !== 
 // 0.1 = 10% of the range. Raise it to be less strict.
 const CRT_ZONE_TOLERANCE = Math.max(0, Number(process.env.CRT_ZONE_TOLERANCE || 0.1));
 
+// CRT_ALERTS: when true (default), a standalone Telegram message is sent each time a
+// NEW CRT forms on one of the CRT_ALERT_TIMEFRAMES, even if price is not at any zone.
+// CRT_ALERT_TIMEFRAMES: default 4H,1D (the slower, more meaningful timeframes).
+// CRT_ALERT_MAX_AGE_MIN: a CRT is only announced if its sweep candle closed within this
+// many minutes, so restarting the bot does not replay old CRTs. Default 60.
+const CRT_ALERTS = String(process.env.CRT_ALERTS || 'true').toLowerCase() !== 'false';
+const CRT_ALERT_TFS = String(process.env.CRT_ALERT_TIMEFRAMES || '4H,1D')
+  .split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
+const CRT_ALERT_MAX_AGE_MS = Math.max(5, Number(process.env.CRT_ALERT_MAX_AGE_MIN || 60)) * 60 * 1000;
+
 /* =========================================================
    ZONE SETTINGS
 ========================================================= */
@@ -699,6 +709,76 @@ async function sendTelegram(text) {
 }
 
 /* =========================================================
+   STANDALONE CRT ALERT (4H / 1D by default)
+========================================================= */
+
+const crtAlerted = new Set();
+
+// Announces a newly formed CRT, whether or not price is at a zone.
+function sendCRTAlerts(pair, p, zones) {
+  if (!CRT_ALERTS || CRT_MODE === 'off' || !Array.isArray(p.crts)) return;
+  const now = Date.now();
+
+  for (const c of p.crts) {
+    if (!CRT_ALERT_TFS.includes(c.timeframe)) continue;
+    const tf = ZONE_TIMEFRAMES.find(t => t.label === c.timeframe);
+    if (!tf) continue;
+
+    const key = `${pair}-${c.timeframe}-${c.direction}-${c.sweepEpoch}`;
+    if (crtAlerted.has(key)) continue;
+    crtAlerted.add(key);
+    if (crtAlerted.size > 3000) crtAlerted.clear(); // old keys fail the age check anyway
+
+    // Only announce fresh CRTs: the sweep candle must have closed recently.
+    const closeMs = (c.sweepEpoch + tf.seconds) * 1000;
+    if (now - closeMs > CRT_ALERT_MAX_AGE_MS) continue;
+
+    const isBuy = c.direction === 'BUY';
+    const atZones = [...new Set(
+      (zones || [])
+        .filter(z => z.direction === c.direction && crtAtZone(c, z))
+        .map(z => `${z.timeframe} ${isBuy ? 'demand' : 'supply'}`)
+    )];
+    const source = p.source === 'twelvedata' ? 'Twelve Data' : 'Deriv';
+
+    const message = [
+      `🕯 CRT DETECTED — ${c.direction} ${prettyPair(pair)} (${c.timeframe})`,
+      isBuy
+        ? `Bullish: the range low was swept, then price closed back inside.`
+        : `Bearish: the range high was swept, then price closed back inside.`,
+      `CRT range: ${fmtPrice(pair, c.rangeLow)} – ${fmtPrice(pair, c.rangeHigh)}`,
+      `Sweep extreme: ${fmtPrice(pair, c.sweepExtreme)}`,
+      `Target: ${fmtPrice(pair, c.target)} (midpoint ${fmtPrice(pair, c.mid)})`,
+      atZones.length ? `Zone at the sweep: ${atZones.join(', ')}` : `Zone at the sweep: none found`,
+      Number.isFinite(p.price) ? `Price now: ${fmtPrice(pair, p.price)}` : null,
+      `Price source: ${source}`,
+      `ℹ️ Informational only. No zone touch is needed for this message.`
+    ].filter(Boolean).join('\n');
+
+    state.signals.unshift({
+      id: `${key}-crt`,
+      time: new Date().toISOString(),
+      pair,
+      direction: c.direction,
+      timeframe: c.timeframe,
+      type: 'CRT',
+      zoneTop: null,
+      zoneBottom: null,
+      crt: { ...c },
+      note: 'Standalone CRT alert; no zone touch required.'
+    });
+    state.signals = state.signals.slice(0, 100);
+
+    sendTelegram(message)
+      .then(ok => log(`${ok ? 'Telegram sent' : 'Signal recorded'}: CRT ${c.direction} ${pair} ${c.timeframe}`))
+      .catch(err => {
+        log(`Telegram send failed: ${err.message}`);
+        state.lastError = `Telegram: ${err.message}`;
+      });
+  }
+}
+
+/* =========================================================
    ZONE TOUCH (immediate warning)
 ========================================================= */
 
@@ -1041,6 +1121,9 @@ async function scanPair(pair) {
 
     state.zones = state.zones.filter(z => z.pair !== pair).concat(pruned);
 
+    // Standalone CRT announcement (4H / 1D by default), independent of zone touches.
+    sendCRTAlerts(pair, p, pruned);
+
     // 4. Fallback touch check when no live tick is available (e.g. Twelve Data crypto).
     if (!hasFreshTick) {
       p.price = last5.close;
@@ -1093,7 +1176,7 @@ async function runScan() {
 }
 
 async function startUp() {
-  log(`CRT mode: ${CRT_MODE}${CRT_MODE === 'off' ? '' : ` | timeframes ${CRT_TFS.map(t => t.label).join(',')} | valid bars ${CRT_VALID_BARS} | at-zone ${CRT_AT_ZONE}`}`);
+  log(`CRT mode: ${CRT_MODE}${CRT_MODE === 'off' ? '' : ` | timeframes ${CRT_TFS.map(t => t.label).join(',')} | valid bars ${CRT_VALID_BARS} | at-zone ${CRT_AT_ZONE} | CRT alerts ${CRT_ALERTS ? CRT_ALERT_TFS.join(',') : 'off'}`}`);
 
   while (true) {
     try {
@@ -1141,7 +1224,7 @@ app.get('/api/status', requireDashboardAuth, (_req, res) => {
     activeSymbolsCount: state.activeSymbolsCount,
     targetPairCount: TARGET_PAIRS.length,
     timeframes: ZONE_TIMEFRAMES.map(tf => tf.label),
-    crt: { mode: CRT_MODE, timeframes: CRT_TFS.map(t => t.label), validBars: CRT_VALID_BARS, atZone: CRT_AT_ZONE, zoneTolerance: CRT_ZONE_TOLERANCE },
+    crt: { mode: CRT_MODE, timeframes: CRT_TFS.map(t => t.label), validBars: CRT_VALID_BARS, atZone: CRT_AT_ZONE, zoneTolerance: CRT_ZONE_TOLERANCE, alerts: CRT_ALERTS ? CRT_ALERT_TFS : [] },
     pairs: Object.values(state.pairs),
     zones: state.zones.slice().sort((a, b) => b.createdAt - a.createdAt),
     signals: state.signals,
