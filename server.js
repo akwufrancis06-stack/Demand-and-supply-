@@ -46,6 +46,30 @@ const ZONE_TIMEFRAMES = [
 const TF_5M = ZONE_TIMEFRAMES[0];
 
 /* =========================================================
+   CRT (CANDLE RANGE THEORY) SETTINGS
+========================================================= */
+
+// CRT_MODE:
+//   off    = CRT is ignored (bot behaves exactly as before)
+//   tag    = CRT info is added to messages, but signals are NOT blocked
+//   filter = signals only fire when an aligned CRT exists (default)
+const CRT_MODE = ['off', 'tag', 'filter'].includes(String(process.env.CRT_MODE || '').toLowerCase())
+  ? String(process.env.CRT_MODE).toLowerCase()
+  : 'filter';
+
+// CRT_TIMEFRAMES: comma-separated list of timeframes checked for CRT.
+// Any of 15M, 30M, 1H, 4H, 1D. Default 1H,4H,1D.
+// (The old single CRT_TIMEFRAME variable still works if CRT_TIMEFRAMES is not set.)
+const CRT_TF_LABELS = String(process.env.CRT_TIMEFRAMES || process.env.CRT_TIMEFRAME || '1H,4H,1D')
+  .split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
+const CRT_TFS = ZONE_TIMEFRAMES.filter(tf => tf.label !== '5M' && CRT_TF_LABELS.includes(tf.label));
+if (!CRT_TFS.length) CRT_TFS.push(ZONE_TIMEFRAMES.find(tf => tf.label === '4H'));
+
+// CRT_VALID_BARS: how many closed CRT-timeframe candles back a sweep candle can be
+// and still count. 1 = only the most recent closed candle, 2 = also the one before.
+const CRT_VALID_BARS = Math.max(1, Math.min(5, Number(process.env.CRT_VALID_BARS || 2)));
+
+/* =========================================================
    ZONE SETTINGS
 ========================================================= */
 
@@ -165,6 +189,84 @@ function calcATR(candles, period = ATR_PERIOD) {
   }
   const slice = trs.slice(-period);
   return slice.reduce((sum, x) => sum + x, 0) / slice.length;
+}
+
+/* =========================================================
+   CRT (CANDLE RANGE THEORY) DETECTION
+========================================================= */
+
+// Looks at the last few CLOSED candles of the CRT timeframe.
+//   Reference candle = the range. Sweep candle = the next candle.
+//   Bullish CRT: sweep candle takes out the reference LOW, closes back inside,
+//                and does not take out the reference HIGH. Target = reference high.
+//   Bearish CRT: sweep candle takes out the reference HIGH, closes back inside,
+//                and does not take out the reference LOW. Target = reference low.
+// A CRT is dropped once a later closed candle closes outside the range or
+// the target has already been reached.
+function detectCRT(candles, tf) {
+  if (!Array.isArray(candles)) return null;
+  const closed = candles.slice(0, -1); // the last candle is still forming
+  if (closed.length < 5) return null;
+
+  const last = closed.length - 1;
+
+  for (let k = 0; k < CRT_VALID_BARS; k++) {
+    const si = last - k;
+    const ri = si - 1;
+    if (ri < 0) break;
+
+    const ref = closed[ri];
+    const sw = closed[si];
+
+    let direction = null;
+    if (sw.low < ref.low && sw.high <= ref.high && sw.close > ref.low && sw.close < ref.high) {
+      direction = 'BUY';
+    } else if (sw.high > ref.high && sw.low >= ref.low && sw.close < ref.high && sw.close > ref.low) {
+      direction = 'SELL';
+    }
+    if (!direction) continue;
+
+    const later = closed.slice(si + 1);
+    const spent = later.some(c => direction === 'BUY'
+      ? (c.close < ref.low || c.high >= ref.high)
+      : (c.close > ref.high || c.low <= ref.low));
+    if (spent) continue;
+
+    return {
+      direction,
+      timeframe: tf.label,
+      rangeHigh: ref.high,
+      rangeLow: ref.low,
+      mid: (ref.high + ref.low) / 2,
+      target: direction === 'BUY' ? ref.high : ref.low,
+      sweepExtreme: direction === 'BUY' ? sw.low : sw.high,
+      sweepEpoch: sw.epoch
+    };
+  }
+
+  return null;
+}
+
+// Returns the pair's CRT if it points the same way as the zone, otherwise null.
+// With several CRT timeframes, the highest-timeframe match supplies the range and
+// target, and `confluence` lists every timeframe that agrees.
+function alignedCRT(pairState, direction) {
+  if (CRT_MODE === 'off' || !pairState || !Array.isArray(pairState.crts)) return null;
+  const matches = pairState.crts.filter(c => c.direction === direction);
+  if (!matches.length) return null;
+  const best = matches[matches.length - 1]; // crts are stored in ascending timeframe order
+  return { ...best, confluence: matches.map(m => m.timeframe) };
+}
+
+// Telegram lines describing the CRT that backs a signal.
+function crtLines(pair, crt) {
+  if (CRT_MODE === 'off') return [];
+  if (!crt) return CRT_MODE === 'tag' ? ['CRT: no aligned setup'] : [];
+  return [
+    `CRT (${(crt.confluence || [crt.timeframe]).join(' + ')}): ${crt.direction === 'BUY' ? 'bullish' : 'bearish'} sweep, closed back inside`,
+    `CRT range (${crt.timeframe}): ${fmtPrice(pair, crt.rangeLow)} – ${fmtPrice(pair, crt.rangeHigh)}`,
+    `CRT target: ${fmtPrice(pair, crt.target)} (midpoint ${fmtPrice(pair, crt.mid)})`
+  ];
 }
 
 /* =========================================================
@@ -581,13 +683,21 @@ async function sendTelegram(text) {
 
 // Alerts once per zone, on its first touch. Overlapping zones touched together
 // produce a single alert for the strongest one.
+// In CRT filter mode, a zone only counts as touched while an aligned CRT exists.
+// If price sits in the zone before the CRT forms, the zone stays untested and
+// can still alert once the CRT appears.
 function checkZoneTouches(pair, price) {
   const pairState = state.pairs[pair];
   if (!pairState || !Number.isFinite(price)) return;
 
-  const touched = state.zones.filter(z =>
+  let touched = state.zones.filter(z =>
     z.pair === pair && !z.tested && price >= z.bottom && price <= z.top
   );
+
+  // CRT filter: keep only zones that agree with the current CRT direction.
+  if (CRT_MODE === 'filter') {
+    touched = touched.filter(z => alignedCRT(pairState, z.direction));
+  }
   if (!touched.length) return;
 
   // Every touched zone is now tested, so none of them can alert again.
@@ -601,6 +711,7 @@ function checkZoneTouches(pair, price) {
   )) return;
 
   const isBuy = zone.direction === 'BUY';
+  const crt = alignedCRT(pairState, zone.direction);
   const atr = pairState.atr5m || (zone.top - zone.bottom) || price * 0.0005;
   const buffer = Math.max(atr * 0.15, price * 0.00005);
   const sl = roundPrice(pair, isBuy ? zone.bottom - buffer : zone.top + buffer);
@@ -622,6 +733,7 @@ function checkZoneTouches(pair, price) {
     zoneBottom: zone.bottom,
     sl,
     tp,
+    crt: crt ? { ...crt } : null,
     completed: false
   };
   state.pendingConfirmations.push(pending);
@@ -641,6 +753,7 @@ function checkZoneTouches(pair, price) {
     tp,
     zoneTop: zone.top,
     zoneBottom: zone.bottom,
+    crt: crt ? { ...crt } : null,
     note: 'First touch of a zone. Wait for a separate 5M rejection confirmation.'
   });
   state.signals = state.signals.slice(0, 100);
@@ -650,6 +763,7 @@ function checkZoneTouches(pair, price) {
     `🔔 ZONE TOUCH — ${zone.direction} ${prettyPair(pair)}`,
     `Zone: ${zone.timeframe} ${isBuy ? 'DEMAND' : 'SUPPLY'} (strength ${zone.score} ATR)`,
     `Zone range: ${fmtPrice(pair, zone.bottom)} – ${fmtPrice(pair, zone.top)}`,
+    ...crtLines(pair, crt),
     `Price at touch: ${fmtPrice(pair, entry)}`,
     `Reference SL: ${fmtPrice(pair, sl)}`,
     `Reference TP (1:${RR}): ${fmtPrice(pair, tp)}`,
@@ -660,7 +774,7 @@ function checkZoneTouches(pair, price) {
   ].filter(Boolean).join('\n');
 
   sendTelegram(message)
-    .then(ok => log(`${ok ? 'Telegram sent' : 'Signal recorded'}: ZONE TOUCH ${zone.direction} ${pair}`))
+    .then(ok => log(`${ok ? 'Telegram sent' : 'Signal recorded'}: ZONE TOUCH ${zone.direction} ${pair}${crt ? ' + CRT' : ''}`))
     .catch(err => {
       log(`Telegram send failed: ${err.message}`);
       state.lastError = `Telegram: ${err.message}`;
@@ -720,6 +834,7 @@ function confirmRejections(pair, candles) {
         tp,
         zoneTop: pending.zoneTop,
         zoneBottom: pending.zoneBottom,
+        crt: pending.crt || null,
         note: 'Completed 5M rejection candle detected. Confirm execution conditions.'
       });
       state.signals = state.signals.slice(0, 100);
@@ -728,6 +843,7 @@ function confirmRejections(pair, candles) {
       const message = [
         `✅ 5M REJECTION CONFIRMED — ${pending.direction} ${prettyPair(pair)}`,
         `Zone: ${pending.timeframe} (strength ${pending.score} ATR)`,
+        ...crtLines(pair, pending.crt),
         `Reference entry (5M close): ${fmtPrice(pair, entry)}`,
         `Stop Loss: ${fmtPrice(pair, pending.sl)}`,
         `Take Profit (1:${RR}): ${fmtPrice(pair, tp)}`,
@@ -765,6 +881,7 @@ async function resolveSymbols() {
       priceTime: null,
       priceSource: null,
       lastScan: null,
+      crt: null,
       error: ''
     };
   }
@@ -812,6 +929,7 @@ async function resolveSymbols() {
       priceTime: null,
       priceSource: null,
       lastScan: null,
+      crt: null,
       error: ''
     };
   }
@@ -843,18 +961,35 @@ async function scanPair(pair) {
   }
 
   try {
-    // 1. Fetch candles for every timeframe. The 5M set is also used for confirmation.
+    // 1. Fetch candles for every timeframe. The 5M set is also used for confirmation,
+    //    and the CRT timeframe's candles are used for CRT detection (no extra requests).
     const newZones = [];
     let candles5m = null;
+    const crtFound = [];
 
     for (const tf of ZONE_TIMEFRAMES) {
       const candles = await getCandles(p, tf);
       await sleep(REQUEST_GAP_MS);
       if (tf === TF_5M) candles5m = candles;
+      if (CRT_TFS.some(t => t.label === tf.label)) {
+        const found = detectCRT(candles, tf);
+        if (found) crtFound.push(found);
+      }
       newZones.push(...makeZones(pair, tf, candles));
     }
 
     if (!candles5m || candles5m.length < 3) throw new Error('Not enough 5M candles');
+
+    // Update CRT before any touch check so the filter sees the latest setup.
+    const crtKey = c => `${c.timeframe}-${c.direction}-${c.sweepEpoch}`;
+    const prevKeys = new Set((p.crts || []).map(crtKey));
+    p.crts = CRT_MODE === 'off' ? [] : crtFound;
+    p.crt = p.crts.length ? p.crts[p.crts.length - 1] : null; // highest timeframe, for the dashboard
+    for (const c of p.crts) {
+      if (!prevKeys.has(crtKey(c))) {
+        log(`CRT ${c.direction} on ${pair} (${c.timeframe}), target ${fmtPrice(pair, c.target)}`);
+      }
+    }
 
     const last5 = candles5m[candles5m.length - 1];
     const atr5m = calcATR(candles5m.slice(0, -1));
@@ -936,6 +1071,8 @@ async function runScan() {
 }
 
 async function startUp() {
+  log(`CRT mode: ${CRT_MODE}${CRT_MODE === 'off' ? '' : ` | timeframes ${CRT_TFS.map(t => t.label).join(',')} | valid bars ${CRT_VALID_BARS}`}`);
+
   while (true) {
     try {
       await deriv.connect();
@@ -982,6 +1119,7 @@ app.get('/api/status', requireDashboardAuth, (_req, res) => {
     activeSymbolsCount: state.activeSymbolsCount,
     targetPairCount: TARGET_PAIRS.length,
     timeframes: ZONE_TIMEFRAMES.map(tf => tf.label),
+    crt: { mode: CRT_MODE, timeframes: CRT_TFS.map(t => t.label), validBars: CRT_VALID_BARS },
     pairs: Object.values(state.pairs),
     zones: state.zones.slice().sort((a, b) => b.createdAt - a.createdAt),
     signals: state.signals,
