@@ -58,16 +58,27 @@ const CRT_MODE = ['off', 'tag', 'filter'].includes(String(process.env.CRT_MODE |
   : 'filter';
 
 // CRT_TIMEFRAMES: comma-separated list of timeframes checked for CRT.
-// Any of 15M, 30M, 1H, 4H, 1D. Default 1H,4H,1D.
+// Any of 5M, 15M, 30M, 1H, 4H, 1D, or ALL for every timeframe.
+// Default: 15M,30M,1H,4H,1D (every timeframe except 5M, which is noisy).
 // (The old single CRT_TIMEFRAME variable still works if CRT_TIMEFRAMES is not set.)
-const CRT_TF_LABELS = String(process.env.CRT_TIMEFRAMES || process.env.CRT_TIMEFRAME || '1H,4H,1D')
+const CRT_TF_LABELS = String(process.env.CRT_TIMEFRAMES || process.env.CRT_TIMEFRAME || '15M,30M,1H,4H,1D')
   .split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
-const CRT_TFS = ZONE_TIMEFRAMES.filter(tf => tf.label !== '5M' && CRT_TF_LABELS.includes(tf.label));
+const CRT_TFS = ZONE_TIMEFRAMES.filter(tf => CRT_TF_LABELS.includes('ALL') || CRT_TF_LABELS.includes(tf.label));
 if (!CRT_TFS.length) CRT_TFS.push(ZONE_TIMEFRAMES.find(tf => tf.label === '4H'));
 
 // CRT_VALID_BARS: how many closed CRT-timeframe candles back a sweep candle can be
 // and still count. 1 = only the most recent closed candle, 2 = also the one before.
 const CRT_VALID_BARS = Math.max(1, Math.min(5, Number(process.env.CRT_VALID_BARS || 2)));
+
+// CRT_AT_ZONE: when true (default), the CRT sweep must happen AT the supply/demand zone.
+// Bullish: the swept area (sweep low up to the range low) must overlap the demand zone.
+// Bearish: the swept area (range high up to the sweep high) must overlap the supply zone.
+// Set CRT_AT_ZONE=false to accept any CRT that points the same way as the zone.
+const CRT_AT_ZONE = String(process.env.CRT_AT_ZONE || 'true').toLowerCase() !== 'false';
+
+// CRT_ZONE_TOLERANCE: extra room around the swept area, as a fraction of the CRT range.
+// 0.1 = 10% of the range. Raise it to be less strict.
+const CRT_ZONE_TOLERANCE = Math.max(0, Number(process.env.CRT_ZONE_TOLERANCE || 0.1));
 
 /* =========================================================
    ZONE SETTINGS
@@ -250,9 +261,18 @@ function detectCRT(candles, tf) {
 // Returns the pair's CRT if it points the same way as the zone, otherwise null.
 // With several CRT timeframes, the highest-timeframe match supplies the range and
 // target, and `confluence` lists every timeframe that agrees.
-function alignedCRT(pairState, direction) {
+function crtAtZone(c, zone) {
+  const tol = (c.rangeHigh - c.rangeLow) * CRT_ZONE_TOLERANCE;
+  const lo = (c.direction === 'BUY' ? c.sweepExtreme : c.rangeHigh) - tol;
+  const hi = (c.direction === 'BUY' ? c.rangeLow : c.sweepExtreme) + tol;
+  return zone.bottom <= hi && zone.top >= lo;
+}
+
+function alignedCRT(pairState, direction, zone) {
   if (CRT_MODE === 'off' || !pairState || !Array.isArray(pairState.crts)) return null;
-  const matches = pairState.crts.filter(c => c.direction === direction);
+  const matches = pairState.crts.filter(c =>
+    c.direction === direction && (!CRT_AT_ZONE || !zone || crtAtZone(c, zone))
+  );
   if (!matches.length) return null;
   const best = matches[matches.length - 1]; // crts are stored in ascending timeframe order
   return { ...best, confluence: matches.map(m => m.timeframe) };
@@ -261,10 +281,11 @@ function alignedCRT(pairState, direction) {
 // Telegram lines describing the CRT that backs a signal.
 function crtLines(pair, crt) {
   if (CRT_MODE === 'off') return [];
-  if (!crt) return CRT_MODE === 'tag' ? ['CRT: no aligned setup'] : [];
+  if (!crt) return CRT_MODE === 'tag' ? ['CRT: none at this zone'] : [];
   return [
     `CRT (${(crt.confluence || [crt.timeframe]).join(' + ')}): ${crt.direction === 'BUY' ? 'bullish' : 'bearish'} sweep, closed back inside`,
     `CRT range (${crt.timeframe}): ${fmtPrice(pair, crt.rangeLow)} – ${fmtPrice(pair, crt.rangeHigh)}`,
+    `CRT sweep extreme: ${fmtPrice(pair, crt.sweepExtreme)}`,
     `CRT target: ${fmtPrice(pair, crt.target)} (midpoint ${fmtPrice(pair, crt.mid)})`
   ];
 }
@@ -683,7 +704,8 @@ async function sendTelegram(text) {
 
 // Alerts once per zone, on its first touch. Overlapping zones touched together
 // produce a single alert for the strongest one.
-// In CRT filter mode, a zone only counts as touched while an aligned CRT exists.
+// In CRT filter mode, a zone only counts as touched while an aligned CRT exists
+// (and, with CRT_AT_ZONE on, only if that CRT's sweep happened at this zone).
 // If price sits in the zone before the CRT forms, the zone stays untested and
 // can still alert once the CRT appears.
 function checkZoneTouches(pair, price) {
@@ -696,7 +718,7 @@ function checkZoneTouches(pair, price) {
 
   // CRT filter: keep only zones that agree with the current CRT direction.
   if (CRT_MODE === 'filter') {
-    touched = touched.filter(z => alignedCRT(pairState, z.direction));
+    touched = touched.filter(z => alignedCRT(pairState, z.direction, z));
   }
   if (!touched.length) return;
 
@@ -711,7 +733,7 @@ function checkZoneTouches(pair, price) {
   )) return;
 
   const isBuy = zone.direction === 'BUY';
-  const crt = alignedCRT(pairState, zone.direction);
+  const crt = alignedCRT(pairState, zone.direction, zone);
   const atr = pairState.atr5m || (zone.top - zone.bottom) || price * 0.0005;
   const buffer = Math.max(atr * 0.15, price * 0.00005);
   const sl = roundPrice(pair, isBuy ? zone.bottom - buffer : zone.top + buffer);
@@ -1071,7 +1093,7 @@ async function runScan() {
 }
 
 async function startUp() {
-  log(`CRT mode: ${CRT_MODE}${CRT_MODE === 'off' ? '' : ` | timeframes ${CRT_TFS.map(t => t.label).join(',')} | valid bars ${CRT_VALID_BARS}`}`);
+  log(`CRT mode: ${CRT_MODE}${CRT_MODE === 'off' ? '' : ` | timeframes ${CRT_TFS.map(t => t.label).join(',')} | valid bars ${CRT_VALID_BARS} | at-zone ${CRT_AT_ZONE}`}`);
 
   while (true) {
     try {
@@ -1119,7 +1141,7 @@ app.get('/api/status', requireDashboardAuth, (_req, res) => {
     activeSymbolsCount: state.activeSymbolsCount,
     targetPairCount: TARGET_PAIRS.length,
     timeframes: ZONE_TIMEFRAMES.map(tf => tf.label),
-    crt: { mode: CRT_MODE, timeframes: CRT_TFS.map(t => t.label), validBars: CRT_VALID_BARS },
+    crt: { mode: CRT_MODE, timeframes: CRT_TFS.map(t => t.label), validBars: CRT_VALID_BARS, atZone: CRT_AT_ZONE, zoneTolerance: CRT_ZONE_TOLERANCE },
     pairs: Object.values(state.pairs),
     zones: state.zones.slice().sort((a, b) => b.createdAt - a.createdAt),
     signals: state.signals,
