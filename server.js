@@ -20,7 +20,13 @@ const REQUEST_TIMEOUT_MS = 25_000;
 const REQUEST_GAP_MS = Math.max(100, Number(process.env.REQUEST_GAP_MS || 250));
 const TICK_SUBSCRIBE_GAP_MS = 200;
 // Twelve Data free plan allows 8 requests per minute. 8 seconds between requests stays under that.
-const TD_GAP_MS = 8000;
+const TD_GAP_MS = Math.max(1000, Number(process.env.TD_GAP_MS || 8000));
+// The free Twelve Data plan also allows only 800 requests PER DAY. The bot stops at this
+// budget (and shows "Paused") instead of running into errors. Raise it only if your plan
+// has a higher daily limit.
+const TD_DAILY_BUDGET = Math.max(10, Number(process.env.TD_DAILY_BUDGET || 750));
+// Crypto candles come from Twelve Data, so crypto is scanned on a slower schedule than forex.
+const CRYPTO_SCAN_INTERVAL_MS = Math.max(SCAN_INTERVAL_MS, Number(process.env.CRYPTO_SCAN_INTERVAL_MIN || 20) * 60_000);
 const CONFIRMATION_MAX_AGE_MS = 30 * 60 * 1000;
 const STOCKS = ['AAPL', 'TSLA', 'NVDA', 'AMZN']; // display only; not scanned
 const RR = 2;
@@ -79,6 +85,25 @@ const CRT_AT_ZONE = String(process.env.CRT_AT_ZONE || 'true').toLowerCase() !== 
 // CRT_ZONE_TOLERANCE: extra room around the swept area, as a fraction of the CRT range.
 // 0.1 = 10% of the range. Raise it to be less strict.
 const CRT_ZONE_TOLERANCE = Math.max(0, Number(process.env.CRT_ZONE_TOLERANCE || 0.1));
+
+// CRT_REQUIRE_COLOR: when true (default), candle 2 (the sweep candle) must close in the
+// trade direction: GREEN (close above open) for a buy CRT, RED (close below open) for a
+// sell CRT. A CRT whose sweep candle has the wrong colour, or no body, is ignored
+// everywhere: no CRT message, and it is not used to pass a zone alert.
+// Set CRT_REQUIRE_COLOR=false to turn this rule off.
+const CRT_REQUIRE_COLOR = String(process.env.CRT_REQUIRE_COLOR || 'true').toLowerCase() !== 'false';
+
+// CRT_MANAGE_TRADE: when true (default) and a CRT backs an alert, the stop goes beyond the
+// CRT sweep extreme (or the zone edge, if that is farther) and the take profit is the CRT
+// target (the opposite end of candle 1's range). Alerts without a CRT keep the zone stop
+// and the 1:2 target.
+// CRT_MAX_SL_MULT: if the sweep stop is more than this many times wider than the zone stop,
+// the zone stop is kept instead and the message says so. Default 3.
+// CRT_MIN_RR: the CRT target is only used if it gives at least this reward-to-risk,
+// otherwise the 1:2 target is used. Default 1.
+const CRT_MANAGE_TRADE = String(process.env.CRT_MANAGE_TRADE || 'true').toLowerCase() !== 'false';
+const CRT_MAX_SL_MULT = Math.max(1, Number(process.env.CRT_MAX_SL_MULT || 3));
+const CRT_MIN_RR = Math.max(0.5, Number(process.env.CRT_MIN_RR || 1));
 
 // CRT_ALERTS: when true (default), a standalone Telegram message is sent each time a
 // NEW CRT forms on one of the CRT_ALERT_TIMEFRAMES, even if price is not at any zone.
@@ -247,6 +272,12 @@ function detectCRT(candles, tf) {
     }
     if (!direction) continue;
 
+    // Colour rule: the sweep candle must close in the trade direction.
+    if (CRT_REQUIRE_COLOR) {
+      if (direction === 'BUY' && !(sw.close > sw.open)) continue;
+      if (direction === 'SELL' && !(sw.close < sw.open)) continue;
+    }
+
     const later = closed.slice(si + 1);
     const spent = later.some(c => direction === 'BUY'
       ? (c.close < ref.low || c.high >= ref.high)
@@ -298,6 +329,58 @@ function crtLines(pair, crt) {
     `CRT sweep extreme: ${fmtPrice(pair, crt.sweepExtreme)}`,
     `CRT target: ${fmtPrice(pair, crt.target)} (midpoint ${fmtPrice(pair, crt.mid)})`
   ];
+}
+
+/* =========================================================
+   TRADE PLAN (stop loss and take profit)
+========================================================= */
+
+// Target for an alert. Default 1:RR. With a CRT behind the alert (CRT_MANAGE_TRADE),
+// the target is the CRT target if it gives at least CRT_MIN_RR, otherwise 1:RR.
+function planTargets(pair, direction, entry, sl, crt) {
+  const isBuy = direction === 'BUY';
+  const risk = Math.abs(entry - sl);
+  let tp = isBuy ? entry + RR * risk : entry - RR * risk;
+  let tpNote = `1:${RR}`;
+  if (CRT_MANAGE_TRADE && crt && Number.isFinite(crt.target)) {
+    const dist = isBuy ? crt.target - entry : entry - crt.target;
+    if (dist >= risk * CRT_MIN_RR) {
+      tp = crt.target;
+      tpNote = 'CRT target';
+    } else {
+      tpNote = `1:${RR}, CRT target too close`;
+    }
+  }
+  tp = roundPrice(pair, tp);
+  return { tp, tpNote, rr: Math.abs(tp - entry) / risk };
+}
+
+// Stop and target for a zone touch. Without a CRT the stop sits just beyond the zone.
+// With a CRT the stop goes beyond the sweep extreme when that is farther than the zone
+// stop, unless it would be more than CRT_MAX_SL_MULT times wider.
+function planTrade(pair, direction, entry, zone, crt, atr) {
+  const isBuy = direction === 'BUY';
+  const buffer = Math.max(atr * 0.15, entry * 0.00005);
+  const zoneSl = isBuy ? zone.bottom - buffer : zone.top + buffer;
+  let sl = zoneSl;
+  let slNote = 'beyond zone';
+
+  if (CRT_MANAGE_TRADE && crt && Number.isFinite(crt.sweepExtreme)) {
+    const sweepSl = isBuy ? crt.sweepExtreme - buffer : crt.sweepExtreme + buffer;
+    const farther = isBuy ? Math.min(zoneSl, sweepSl) : Math.max(zoneSl, sweepSl);
+    const zoneRisk = Math.abs(entry - zoneSl);
+    if (zoneRisk > 0 && Math.abs(entry - farther) > zoneRisk * CRT_MAX_SL_MULT) {
+      slNote = 'CRT stop too wide, zone stop used';
+    } else if (farther === sweepSl && sweepSl !== zoneSl) {
+      sl = sweepSl;
+      slNote = 'beyond CRT sweep';
+    }
+  }
+
+  sl = roundPrice(pair, sl);
+  const risk = Math.abs(entry - sl);
+  if (!(risk > 0) || (isBuy ? entry <= sl : entry >= sl)) return null;
+  return { sl, slNote, ...planTargets(pair, direction, entry, sl, crt) };
 }
 
 /* =========================================================
@@ -629,6 +712,51 @@ const deriv = new DerivSocket();
    TWELVE DATA (crypto candles)
 ========================================================= */
 
+// Free plan: 8 requests per minute AND 800 per day. To stay inside both, the bot
+//  - spaces requests out (TD_GAP_MS),
+//  - caches candles and only re-fetches a timeframe once a new candle has formed,
+//  - scans crypto every CRYPTO_SCAN_INTERVAL_MS instead of on every forex scan,
+//  - stops at TD_DAILY_BUDGET and shows "Paused" instead of "Scan error".
+class TdLimitError extends Error {
+  constructor(message, resumeAtMs) {
+    super(message);
+    this.name = 'TdLimitError';
+    this.resumeAtMs = resumeAtMs;
+  }
+}
+
+const td = { day: '', used: 0, pausedUntil: 0, pauseReason: '' };
+const tdCache = new Map();
+
+function nextUtcResumeMs() {
+  const d = new Date();
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 1, 0);
+}
+
+// Throws TdLimitError if Twelve Data should not be called right now.
+function tdCheckAllowed(needed = 1) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (td.day !== today) { // new UTC day: the daily counter resets
+    td.day = today;
+    td.used = 0;
+    if (td.pauseReason === 'daily') { td.pausedUntil = 0; td.pauseReason = ''; }
+  }
+  if (td.pausedUntil && Date.now() >= td.pausedUntil) { td.pausedUntil = 0; td.pauseReason = ''; }
+  if (td.pausedUntil) {
+    throw new TdLimitError(
+      td.pauseReason === 'daily'
+        ? 'Twelve Data daily limit reached, resumes 00:01 UTC'
+        : 'Twelve Data per-minute limit hit, waiting a minute',
+      td.pausedUntil
+    );
+  }
+  if (td.used + needed > TD_DAILY_BUDGET) {
+    td.pausedUntil = nextUtcResumeMs();
+    td.pauseReason = 'daily';
+    throw new TdLimitError('Twelve Data daily budget used, resumes 00:01 UTC', td.pausedUntil);
+  }
+}
+
 // Serialises Twelve Data requests so they never exceed the per-minute limit,
 // even when several scan workers run at once.
 let tdChain = Promise.resolve();
@@ -636,11 +764,27 @@ let tdLastCall = 0;
 
 function tdRequest(url) {
   const run = tdChain.then(async () => {
+    tdCheckAllowed(1);
     const wait = TD_GAP_MS - (Date.now() - tdLastCall);
     if (wait > 0) await sleep(wait);
+    tdCheckAllowed(1); // check again after waiting; a limit may have been hit meanwhile
     tdLastCall = Date.now();
+    td.used++;
     const res = await fetch(url);
-    return res.json();
+    const data = await res.json();
+    const msg = String((data && data.message) || '');
+    if (data && (data.code === 429 || /run out of API credits|too many requests/i.test(msg))) {
+      if (/for the day/i.test(msg)) {
+        td.pausedUntil = nextUtcResumeMs();
+        td.pauseReason = 'daily';
+        td.used = Math.max(td.used, TD_DAILY_BUDGET);
+        throw new TdLimitError('Twelve Data daily limit reached, resumes 00:01 UTC', td.pausedUntil);
+      }
+      td.pausedUntil = Date.now() + 65_000;
+      td.pauseReason = 'minute';
+      throw new TdLimitError('Twelve Data per-minute limit hit, waiting a minute', td.pausedUntil);
+    }
+    return data;
   });
   tdChain = run.catch(() => {});
   return run;
@@ -676,10 +820,23 @@ async function twelveHistory(tdSymbol, interval) {
     .reverse();
 }
 
+// Re-fetches a timeframe only once a new candle has formed since the last fetch.
+async function twelveCandles(tdSymbol, tf) {
+  const key = `${tdSymbol}|${tf.tdInterval}`;
+  const cached = tdCache.get(key);
+  if (cached && cached.length) {
+    const last = cached[cached.length - 1];
+    if (Date.now() / 1000 < last.epoch + tf.seconds + 15) return cached;
+  }
+  const candles = await twelveHistory(tdSymbol, tf.tdInterval);
+  tdCache.set(key, candles);
+  return candles;
+}
+
 // Returns candles for a pair and timeframe, from whichever source the pair uses.
 async function getCandles(p, tf) {
   if (p.source === 'twelvedata') {
-    return twelveHistory(p.symbol, tf.tdInterval);
+    return twelveCandles(p.symbol, tf);
   }
   return deriv.history(p.symbol, tf.seconds);
 }
@@ -815,12 +972,10 @@ function checkZoneTouches(pair, price) {
   const isBuy = zone.direction === 'BUY';
   const crt = alignedCRT(pairState, zone.direction, zone);
   const atr = pairState.atr5m || (zone.top - zone.bottom) || price * 0.0005;
-  const buffer = Math.max(atr * 0.15, price * 0.00005);
-  const sl = roundPrice(pair, isBuy ? zone.bottom - buffer : zone.top + buffer);
   const entry = roundPrice(pair, price);
-  const risk = Math.abs(entry - sl);
-  if (!(risk > 0) || (isBuy ? entry <= sl : entry >= sl)) return;
-  const tp = roundPrice(pair, isBuy ? entry + RR * risk : entry - RR * risk);
+  const plan = planTrade(pair, zone.direction, entry, zone, crt, atr);
+  if (!plan) return;
+  const { sl, tp } = plan;
 
   const now = Date.now();
   const pending = {
@@ -834,6 +989,7 @@ function checkZoneTouches(pair, price) {
     zoneTop: zone.top,
     zoneBottom: zone.bottom,
     sl,
+    slNote: plan.slNote,
     tp,
     crt: crt ? { ...crt } : null,
     completed: false
@@ -867,8 +1023,8 @@ function checkZoneTouches(pair, price) {
     `Zone range: ${fmtPrice(pair, zone.bottom)} – ${fmtPrice(pair, zone.top)}`,
     ...crtLines(pair, crt),
     `Price at touch: ${fmtPrice(pair, entry)}`,
-    `Reference SL: ${fmtPrice(pair, sl)}`,
-    `Reference TP (1:${RR}): ${fmtPrice(pair, tp)}`,
+    `Reference SL: ${fmtPrice(pair, sl)} (${plan.slNote})`,
+    `Reference TP: ${fmtPrice(pair, tp)} (${plan.tpNote}, R:R 1:${plan.rr.toFixed(1)})`,
     touched.length > 1 ? `Also touched: ${touched.length - 1} overlapping zone(s)` : null,
     `Next: waiting for a completed 5M rejection candle.`,
     `Price source: ${source}`,
@@ -920,7 +1076,8 @@ function confirmRejections(pair, candles) {
         log(`Confirmation skipped: invalid risk for ${pair}`);
         continue;
       }
-      const tp = roundPrice(pair, pending.direction === 'BUY' ? entry + RR * risk : entry - RR * risk);
+      const plan = planTargets(pair, pending.direction, entry, pending.sl, pending.crt);
+      const tp = plan.tp;
 
       pending.completed = true;
 
@@ -947,8 +1104,8 @@ function confirmRejections(pair, candles) {
         `Zone: ${pending.timeframe} (strength ${pending.score} ATR)`,
         ...crtLines(pair, pending.crt),
         `Reference entry (5M close): ${fmtPrice(pair, entry)}`,
-        `Stop Loss: ${fmtPrice(pair, pending.sl)}`,
-        `Take Profit (1:${RR}): ${fmtPrice(pair, tp)}`,
+        `Stop Loss: ${fmtPrice(pair, pending.sl)}${pending.slNote ? ` (${pending.slNote})` : ''}`,
+        `Take Profit: ${fmtPrice(pair, tp)} (${plan.tpNote}, R:R 1:${plan.rr.toFixed(1)})`,
         `Zone range: ${fmtPrice(pair, pending.zoneBottom)} – ${fmtPrice(pair, pending.zoneTop)}`,
         `Confirmation candle: ${new Date(candle.epoch * 1000).toISOString()}`,
         `Price source: ${source}`,
@@ -1062,6 +1219,21 @@ async function scanPair(pair) {
     return;
   }
 
+  if (p.source === 'twelvedata') {
+    try {
+      tdCheckAllowed(6); // a full scan of one pair needs up to 6 requests
+    } catch (e) {
+      if (e instanceof TdLimitError) {
+        p.status = `Paused: ${e.message}`;
+        p.error = '';
+        return;
+      }
+      throw e;
+    }
+    // The next crypto scan is due after the crypto interval; runScan skips it until then.
+    p.nextDueMs = Date.now() + CRYPTO_SCAN_INTERVAL_MS - 60_000;
+  }
+
   try {
     // 1. Fetch candles for every timeframe. The 5M set is also used for confirmation,
     //    and the CRT timeframe's candles are used for CRT detection (no extra requests).
@@ -1136,7 +1308,19 @@ async function scanPair(pair) {
     p.zoneCount = pruned.length;
     p.lastScan = new Date().toISOString();
     p.error = '';
+    p.tdPauseLogged = false;
   } catch (err) {
+    if (err instanceof TdLimitError) {
+      // Not a real error: Twelve Data's free limit was reached. Wait it out quietly.
+      p.status = `Paused: ${err.message}`;
+      p.error = '';
+      p.nextDueMs = err.resumeAtMs || 0;
+      if (!p.tdPauseLogged) {
+        log(`${pair}: ${err.message}`);
+        p.tdPauseLogged = true;
+      }
+      return;
+    }
     p.status = 'Scan error';
     p.error = err.message;
     state.lastError = `${pair}: ${err.message}`;
@@ -1155,7 +1339,14 @@ async function runScan() {
     if (!state.connected) {
       await deriv.connect();
     }
-    const pairs = TARGET_PAIRS.filter(pair => state.pairs[pair] && state.pairs[pair].symbol);
+    const nowMs = Date.now();
+    const pairs = TARGET_PAIRS.filter(pair => {
+      const p = state.pairs[pair];
+      if (!p || !p.symbol) return false;
+      // Crypto (Twelve Data) runs on its own, slower schedule.
+      if (p.source === 'twelvedata' && p.nextDueMs && nowMs < p.nextDueMs) return false;
+      return true;
+    });
     // Three workers. Twelve Data calls are serialised separately inside tdRequest.
     let cursor = 0;
     const workers = Array.from({ length: 3 }, async () => {
@@ -1176,7 +1367,8 @@ async function runScan() {
 }
 
 async function startUp() {
-  log(`CRT mode: ${CRT_MODE}${CRT_MODE === 'off' ? '' : ` | timeframes ${CRT_TFS.map(t => t.label).join(',')} | valid bars ${CRT_VALID_BARS} | at-zone ${CRT_AT_ZONE} | CRT alerts ${CRT_ALERTS ? CRT_ALERT_TFS.join(',') : 'off'}`}`);
+  log(`Twelve Data: ${TD_DAILY_BUDGET}/day budget, crypto scanned every ${Math.round(CRYPTO_SCAN_INTERVAL_MS / 60000)} min`);
+  log(`CRT mode: ${CRT_MODE}${CRT_MODE === 'off' ? '' : ` | timeframes ${CRT_TFS.map(t => t.label).join(',')} | valid bars ${CRT_VALID_BARS} | at-zone ${CRT_AT_ZONE} | color rule ${CRT_REQUIRE_COLOR} | trade plan ${CRT_MANAGE_TRADE} | CRT alerts ${CRT_ALERTS ? CRT_ALERT_TFS.join(',') : 'off'}`}`);
 
   while (true) {
     try {
@@ -1224,7 +1416,13 @@ app.get('/api/status', requireDashboardAuth, (_req, res) => {
     activeSymbolsCount: state.activeSymbolsCount,
     targetPairCount: TARGET_PAIRS.length,
     timeframes: ZONE_TIMEFRAMES.map(tf => tf.label),
-    crt: { mode: CRT_MODE, timeframes: CRT_TFS.map(t => t.label), validBars: CRT_VALID_BARS, atZone: CRT_AT_ZONE, zoneTolerance: CRT_ZONE_TOLERANCE, alerts: CRT_ALERTS ? CRT_ALERT_TFS : [] },
+    crt: { mode: CRT_MODE, timeframes: CRT_TFS.map(t => t.label), validBars: CRT_VALID_BARS, atZone: CRT_AT_ZONE, requireColor: CRT_REQUIRE_COLOR, manageTrade: CRT_MANAGE_TRADE, zoneTolerance: CRT_ZONE_TOLERANCE, alerts: CRT_ALERTS ? CRT_ALERT_TFS : [] },
+    twelveData: {
+      usedToday: td.used,
+      dailyBudget: TD_DAILY_BUDGET,
+      pausedUntil: td.pausedUntil ? new Date(td.pausedUntil).toISOString() : null,
+      cryptoScanEveryMin: Math.round(CRYPTO_SCAN_INTERVAL_MS / 60000)
+    },
     pairs: Object.values(state.pairs),
     zones: state.zones.slice().sort((a, b) => b.createdAt - a.createdAt),
     signals: state.signals,
