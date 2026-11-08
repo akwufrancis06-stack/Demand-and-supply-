@@ -45,7 +45,10 @@ const ZONE_TIMEFRAMES = [
   { label: '30M', seconds: 1800,  tdInterval: '30min', maxAgeBars: 96 },  // about 2 days
   { label: '1H',  seconds: 3600,  tdInterval: '1h',    maxAgeBars: 120 }, // about 5 days
   { label: '4H',  seconds: 14400, tdInterval: '4h',    maxAgeBars: 60 },  // about 10 days
-  { label: '1D',  seconds: 86400, tdInterval: '1day',  maxAgeBars: 30 }   // about 30 days
+  { label: '1D',  seconds: 86400, tdInterval: '1day',  maxAgeBars: 30 },  // about 30 days
+  // 1W is built from the daily candles (Deriv has no weekly data) and is used for CRT only,
+  // not for zones. It needs no extra requests.
+  { label: '1W',  seconds: 604800, tdInterval: '1week', maxAgeBars: 0, zones: false, derivedFrom: '1D' }
 ];
 
 // The 5M timeframe is also used for rejection confirmation.
@@ -65,9 +68,9 @@ const CRT_MODE = ['off', 'tag', 'filter'].includes(String(process.env.CRT_MODE |
 
 // CRT_TIMEFRAMES: comma-separated list of timeframes checked for CRT.
 // Any of 5M, 15M, 30M, 1H, 4H, 1D, or ALL for every timeframe.
-// Default: 15M,30M,1H,4H,1D (every timeframe except 5M, which is noisy).
+// Default: 15M,30M,1H,4H,1D,1W (every timeframe except 5M, which is noisy).
 // (The old single CRT_TIMEFRAME variable still works if CRT_TIMEFRAMES is not set.)
-const CRT_TF_LABELS = String(process.env.CRT_TIMEFRAMES || process.env.CRT_TIMEFRAME || '15M,30M,1H,4H,1D')
+const CRT_TF_LABELS = String(process.env.CRT_TIMEFRAMES || process.env.CRT_TIMEFRAME || '15M,30M,1H,4H,1D,1W')
   .split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
 const CRT_TFS = ZONE_TIMEFRAMES.filter(tf => CRT_TF_LABELS.includes('ALL') || CRT_TF_LABELS.includes(tf.label));
 if (!CRT_TFS.length) CRT_TFS.push(ZONE_TIMEFRAMES.find(tf => tf.label === '4H'));
@@ -75,6 +78,15 @@ if (!CRT_TFS.length) CRT_TFS.push(ZONE_TIMEFRAMES.find(tf => tf.label === '4H'))
 // CRT_VALID_BARS: how many closed CRT-timeframe candles back a sweep candle can be
 // and still count. 1 = only the most recent closed candle, 2 = also the one before.
 const CRT_VALID_BARS = Math.max(1, Math.min(5, Number(process.env.CRT_VALID_BARS || 2)));
+
+// CRT_CONFIRM_CANDLE3: when true (default), a CRT only counts once candle 3 (the candle right
+// after the sweep candle, on the same timeframe) has CLOSED in the trade direction (green for
+// a buy, red for a sell) AND inside candle 1's range. This is the strict version: candle 3 is
+// the only chance. If it closes the wrong colour, or outside the range, that CRT is dropped.
+// With this on, CRT_VALID_BARS counts the closed candles back from the confirming candle 3.
+// Alerts arrive one candle of that timeframe later, because the bot waits for candle 3 to close.
+// Set CRT_CONFIRM_CANDLE3=false to use the sweep candle's close as the confirmation.
+const CRT_CONFIRM_CANDLE3 = String(process.env.CRT_CONFIRM_CANDLE3 || 'true').toLowerCase() !== 'false';
 
 // CRT_AT_ZONE: when true (default), the CRT sweep must happen AT the supply/demand zone.
 // Bullish: the swept area (sweep low up to the range low) must overlap the demand zone.
@@ -107,11 +119,11 @@ const CRT_MIN_RR = Math.max(0.5, Number(process.env.CRT_MIN_RR || 1));
 
 // CRT_ALERTS: when true (default), a standalone Telegram message is sent each time a
 // NEW CRT forms on one of the CRT_ALERT_TIMEFRAMES, even if price is not at any zone.
-// CRT_ALERT_TIMEFRAMES: default 4H,1D (the slower, more meaningful timeframes).
+// CRT_ALERT_TIMEFRAMES: default 1H,4H,1D,1W. Remove 1H if it sends too many messages.
 // CRT_ALERT_MAX_AGE_MIN: a CRT is only announced if its sweep candle closed within this
 // many minutes, so restarting the bot does not replay old CRTs. Default 60.
 const CRT_ALERTS = String(process.env.CRT_ALERTS || 'true').toLowerCase() !== 'false';
-const CRT_ALERT_TFS = String(process.env.CRT_ALERT_TIMEFRAMES || '4H,1D')
+const CRT_ALERT_TFS = String(process.env.CRT_ALERT_TIMEFRAMES || '1H,4H,1D,1W')
   .split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
 const CRT_ALERT_MAX_AGE_MS = Math.max(5, Number(process.env.CRT_ALERT_MAX_AGE_MIN || 60)) * 60 * 1000;
 
@@ -256,7 +268,11 @@ function detectCRT(candles, tf) {
 
   const last = closed.length - 1;
 
-  for (let k = 0; k < CRT_VALID_BARS; k++) {
+  // With the candle-3 rule, candle 3 is the last closed candle at the earliest (k = 1).
+  const firstK = CRT_CONFIRM_CANDLE3 ? 1 : 0;
+  const lastK = CRT_CONFIRM_CANDLE3 ? CRT_VALID_BARS : CRT_VALID_BARS - 1;
+
+  for (let k = firstK; k <= lastK; k++) {
     const si = last - k;
     const ri = si - 1;
     if (ri < 0) break;
@@ -278,6 +294,16 @@ function detectCRT(candles, tf) {
       if (direction === 'SELL' && !(sw.close < sw.open)) continue;
     }
 
+    // Strict candle-3 rule: the next candle must close in the trade direction and inside
+    // candle 1's range. One chance only: otherwise this CRT is dropped.
+    let c3 = null;
+    if (CRT_CONFIRM_CANDLE3) {
+      c3 = closed[si + 1];
+      const inside = c3.close > ref.low && c3.close < ref.high;
+      const rightColour = direction === 'BUY' ? c3.close > c3.open : c3.close < c3.open;
+      if (!inside || !rightColour) continue;
+    }
+
     const later = closed.slice(si + 1);
     const spent = later.some(c => direction === 'BUY'
       ? (c.close < ref.low || c.high >= ref.high)
@@ -292,7 +318,9 @@ function detectCRT(candles, tf) {
       mid: (ref.high + ref.low) / 2,
       target: direction === 'BUY' ? ref.high : ref.low,
       sweepExtreme: direction === 'BUY' ? sw.low : sw.high,
-      sweepEpoch: sw.epoch
+      sweepEpoch: sw.epoch,
+      confirmed: !!c3,
+      confirmEpoch: c3 ? c3.epoch : null
     };
   }
 
@@ -324,7 +352,7 @@ function crtLines(pair, crt) {
   if (CRT_MODE === 'off') return [];
   if (!crt) return CRT_MODE === 'tag' ? ['CRT: none at this zone'] : [];
   return [
-    `CRT (${(crt.confluence || [crt.timeframe]).join(' + ')}): ${crt.direction === 'BUY' ? 'bullish' : 'bearish'} sweep, closed back inside`,
+    `CRT (${(crt.confluence || [crt.timeframe]).join(' + ')}): ${crt.direction === 'BUY' ? 'bullish' : 'bearish'} sweep, closed back inside${crt.confirmed ? ', candle 3 confirmed' : ''}`,
     `CRT range (${crt.timeframe}): ${fmtPrice(pair, crt.rangeLow)} – ${fmtPrice(pair, crt.rangeHigh)}`,
     `CRT sweep extreme: ${fmtPrice(pair, crt.sweepExtreme)}`,
     `CRT target: ${fmtPrice(pair, crt.target)} (midpoint ${fmtPrice(pair, crt.mid)})`
@@ -841,6 +869,27 @@ async function getCandles(p, tf) {
   return deriv.history(p.symbol, tf.seconds);
 }
 
+// Builds weekly candles (weeks start Monday 00:00 UTC) from daily candles.
+// shiftSec: forex and gold open on Sunday evening, so their Sunday daily candle belongs to
+// the NEXT week (shift of one day). Crypto trades all weekend, so it uses no shift.
+function weeklyFromDaily(daily, shiftSec) {
+  const WEEK = 604800;
+  const MONDAY0 = 345600; // 1970-01-05 00:00 UTC was a Monday
+  const weeks = new Map();
+  for (const c of daily) {
+    const idx = Math.floor((c.epoch + shiftSec - MONDAY0) / WEEK);
+    const w = weeks.get(idx);
+    if (!w) {
+      weeks.set(idx, { epoch: MONDAY0 + idx * WEEK, open: c.open, high: c.high, low: c.low, close: c.close });
+    } else {
+      w.high = Math.max(w.high, c.high);
+      w.low = Math.min(w.low, c.low);
+      w.close = c.close;
+    }
+  }
+  return [...weeks.entries()].sort((a, b) => a[0] - b[0]).map(e => e[1]);
+}
+
 /* =========================================================
    TELEGRAM
 ========================================================= */
@@ -887,7 +936,7 @@ function sendCRTAlerts(pair, p, zones) {
     if (crtAlerted.size > 3000) crtAlerted.clear(); // old keys fail the age check anyway
 
     // Only announce fresh CRTs: the sweep candle must have closed recently.
-    const closeMs = (c.sweepEpoch + tf.seconds) * 1000;
+    const closeMs = ((c.confirmEpoch || c.sweepEpoch) + tf.seconds) * 1000;
     if (now - closeMs > CRT_ALERT_MAX_AGE_MS) continue;
 
     const isBuy = c.direction === 'BUY';
@@ -903,6 +952,7 @@ function sendCRTAlerts(pair, p, zones) {
       isBuy
         ? `Bullish: the range low was swept, then price closed back inside.`
         : `Bearish: the range high was swept, then price closed back inside.`,
+      c.confirmed ? `Candle 3 confirmed: closed ${isBuy ? 'green' : 'red'} inside the range.` : null,
       `CRT range: ${fmtPrice(pair, c.rangeLow)} – ${fmtPrice(pair, c.rangeHigh)}`,
       `Sweep extreme: ${fmtPrice(pair, c.sweepExtreme)}`,
       `Target: ${fmtPrice(pair, c.target)} (midpoint ${fmtPrice(pair, c.mid)})`,
@@ -1241,15 +1291,24 @@ async function scanPair(pair) {
     let candles5m = null;
     const crtFound = [];
 
+    let daily = null;
     for (const tf of ZONE_TIMEFRAMES) {
-      const candles = await getCandles(p, tf);
-      await sleep(REQUEST_GAP_MS);
+      let candles;
+      if (tf.derivedFrom) {
+        // Weekly candles are built from the daily candles fetched just before.
+        if (!daily) continue;
+        candles = weeklyFromDaily(daily, p.source === 'deriv' ? 86400 : 0);
+      } else {
+        candles = await getCandles(p, tf);
+        await sleep(REQUEST_GAP_MS);
+        if (tf.label === '1D') daily = candles;
+      }
       if (tf === TF_5M) candles5m = candles;
       if (CRT_TFS.some(t => t.label === tf.label)) {
         const found = detectCRT(candles, tf);
         if (found) crtFound.push(found);
       }
-      newZones.push(...makeZones(pair, tf, candles));
+      if (tf.zones !== false) newZones.push(...makeZones(pair, tf, candles));
     }
 
     if (!candles5m || candles5m.length < 3) throw new Error('Not enough 5M candles');
@@ -1368,7 +1427,7 @@ async function runScan() {
 
 async function startUp() {
   log(`Twelve Data: ${TD_DAILY_BUDGET}/day budget, crypto scanned every ${Math.round(CRYPTO_SCAN_INTERVAL_MS / 60000)} min`);
-  log(`CRT mode: ${CRT_MODE}${CRT_MODE === 'off' ? '' : ` | timeframes ${CRT_TFS.map(t => t.label).join(',')} | valid bars ${CRT_VALID_BARS} | at-zone ${CRT_AT_ZONE} | color rule ${CRT_REQUIRE_COLOR} | trade plan ${CRT_MANAGE_TRADE} | CRT alerts ${CRT_ALERTS ? CRT_ALERT_TFS.join(',') : 'off'}`}`);
+  log(`CRT mode: ${CRT_MODE}${CRT_MODE === 'off' ? '' : ` | timeframes ${CRT_TFS.map(t => t.label).join(',')} | valid bars ${CRT_VALID_BARS} | at-zone ${CRT_AT_ZONE} | color rule ${CRT_REQUIRE_COLOR} | candle-3 rule ${CRT_CONFIRM_CANDLE3} | trade plan ${CRT_MANAGE_TRADE} | CRT alerts ${CRT_ALERTS ? CRT_ALERT_TFS.join(',') : 'off'}`}`);
 
   while (true) {
     try {
@@ -1416,7 +1475,7 @@ app.get('/api/status', requireDashboardAuth, (_req, res) => {
     activeSymbolsCount: state.activeSymbolsCount,
     targetPairCount: TARGET_PAIRS.length,
     timeframes: ZONE_TIMEFRAMES.map(tf => tf.label),
-    crt: { mode: CRT_MODE, timeframes: CRT_TFS.map(t => t.label), validBars: CRT_VALID_BARS, atZone: CRT_AT_ZONE, requireColor: CRT_REQUIRE_COLOR, manageTrade: CRT_MANAGE_TRADE, zoneTolerance: CRT_ZONE_TOLERANCE, alerts: CRT_ALERTS ? CRT_ALERT_TFS : [] },
+    crt: { mode: CRT_MODE, timeframes: CRT_TFS.map(t => t.label), validBars: CRT_VALID_BARS, atZone: CRT_AT_ZONE, requireColor: CRT_REQUIRE_COLOR, manageTrade: CRT_MANAGE_TRADE, confirmCandle3: CRT_CONFIRM_CANDLE3, zoneTolerance: CRT_ZONE_TOLERANCE, alerts: CRT_ALERTS ? CRT_ALERT_TFS : [] },
     twelveData: {
       usedToday: td.used,
       dailyBudget: TD_DAILY_BUDGET,
