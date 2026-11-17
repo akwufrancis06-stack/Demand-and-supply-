@@ -44,6 +44,10 @@ const ZONE_TIMEFRAMES = [
   { label: '15M', seconds: 900,   tdInterval: '15min', maxAgeBars: 120 }, // about 30 hours
   { label: '30M', seconds: 1800,  tdInterval: '30min', maxAgeBars: 96 },  // about 2 days
   { label: '1H',  seconds: 3600,  tdInterval: '1h',    maxAgeBars: 120 }, // about 5 days
+  // 2H and 3H are built from the 1H candles (Deriv has no 3H data) and are used for CRT only,
+  // not for zones. They need no extra requests.
+  { label: '2H',  seconds: 7200,  tdInterval: '2h',    maxAgeBars: 0, zones: false, derivedFrom: '1H' },
+  { label: '3H',  seconds: 10800, tdInterval: '3h',    maxAgeBars: 0, zones: false, derivedFrom: '1H' },
   { label: '4H',  seconds: 14400, tdInterval: '4h',    maxAgeBars: 60 },  // about 10 days
   { label: '1D',  seconds: 86400, tdInterval: '1day',  maxAgeBars: 30 },  // about 30 days
   // 1W is built from the daily candles (Deriv has no weekly data) and is used for CRT only,
@@ -67,10 +71,10 @@ const CRT_MODE = ['off', 'tag', 'filter'].includes(String(process.env.CRT_MODE |
   : 'filter';
 
 // CRT_TIMEFRAMES: comma-separated list of timeframes checked for CRT.
-// Any of 5M, 15M, 30M, 1H, 4H, 1D, or ALL for every timeframe.
-// Default: 15M,30M,1H,4H,1D,1W (every timeframe except 5M, which is noisy).
+// Any of 5M, 15M, 30M, 1H, 2H, 3H, 4H, 1D, 1W, or ALL for every timeframe.
+// Default: 15M,30M,1H,2H,3H,4H,1D,1W (every timeframe except 5M, which is noisy).
 // (The old single CRT_TIMEFRAME variable still works if CRT_TIMEFRAMES is not set.)
-const CRT_TF_LABELS = String(process.env.CRT_TIMEFRAMES || process.env.CRT_TIMEFRAME || '15M,30M,1H,4H,1D,1W')
+const CRT_TF_LABELS = String(process.env.CRT_TIMEFRAMES || process.env.CRT_TIMEFRAME || '15M,30M,1H,2H,3H,4H,1D,1W')
   .split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
 const CRT_TFS = ZONE_TIMEFRAMES.filter(tf => CRT_TF_LABELS.includes('ALL') || CRT_TF_LABELS.includes(tf.label));
 if (!CRT_TFS.length) CRT_TFS.push(ZONE_TIMEFRAMES.find(tf => tf.label === '4H'));
@@ -119,11 +123,11 @@ const CRT_MIN_RR = Math.max(0.5, Number(process.env.CRT_MIN_RR || 1));
 
 // CRT_ALERTS: when true (default), a standalone Telegram message is sent each time a
 // NEW CRT forms on one of the CRT_ALERT_TIMEFRAMES, even if price is not at any zone.
-// CRT_ALERT_TIMEFRAMES: default 1H,4H,1D,1W. Remove 1H if it sends too many messages.
+// CRT_ALERT_TIMEFRAMES: default 15M,1H,2H,3H,4H,1D,1W. Remove 15M or 1H if they send too many messages.
 // CRT_ALERT_MAX_AGE_MIN: a CRT is only announced if its sweep candle closed within this
 // many minutes, so restarting the bot does not replay old CRTs. Default 60.
 const CRT_ALERTS = String(process.env.CRT_ALERTS || 'true').toLowerCase() !== 'false';
-const CRT_ALERT_TFS = String(process.env.CRT_ALERT_TIMEFRAMES || '1H,4H,1D,1W')
+const CRT_ALERT_TFS = String(process.env.CRT_ALERT_TIMEFRAMES || '15M,1H,2H,3H,4H,1D,1W')
   .split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
 const CRT_ALERT_MAX_AGE_MS = Math.max(5, Number(process.env.CRT_ALERT_MAX_AGE_MIN || 60)) * 60 * 1000;
 
@@ -325,6 +329,46 @@ function detectCRT(candles, tf) {
   }
 
   return null;
+}
+
+// EARLY WARNING. Looks only at the last closed candle of the timeframe. If it swept the
+// previous candle's high or low and closed back inside that range (candle 2 of a CRT), this
+// is a POSSIBLE CRT. It is the same moment the CRT marker appears on the chart. Candle 3 has
+// not closed yet, so nothing is confirmed. Uses the same sweep and colour rules as detectCRT.
+// Only used while CRT_CONFIRM_CANDLE3 is on; with it off, detectCRT already fires at candle 2.
+function detectCRTWarning(candles, tf) {
+  if (!Array.isArray(candles)) return null;
+  const closed = candles.slice(0, -1); // the last candle is still forming
+  if (closed.length < 5) return null;
+
+  const sw = closed[closed.length - 1];
+  const ref = closed[closed.length - 2];
+
+  let direction = null;
+  if (sw.low < ref.low && sw.high <= ref.high && sw.close > ref.low && sw.close < ref.high) {
+    direction = 'BUY';
+  } else if (sw.high > ref.high && sw.low >= ref.low && sw.close < ref.high && sw.close > ref.low) {
+    direction = 'SELL';
+  }
+  if (!direction) return null;
+
+  if (CRT_REQUIRE_COLOR) {
+    if (direction === 'BUY' && !(sw.close > sw.open)) return null;
+    if (direction === 'SELL' && !(sw.close < sw.open)) return null;
+  }
+
+  return {
+    direction,
+    timeframe: tf.label,
+    rangeHigh: ref.high,
+    rangeLow: ref.low,
+    mid: (ref.high + ref.low) / 2,
+    target: direction === 'BUY' ? ref.high : ref.low,
+    sweepExtreme: direction === 'BUY' ? sw.low : sw.high,
+    sweepEpoch: sw.epoch,
+    confirmed: false,
+    confirmEpoch: null
+  };
 }
 
 // Returns the pair's CRT if it points the same way as the zone, otherwise null.
@@ -890,6 +934,26 @@ function weeklyFromDaily(daily, shiftSec) {
   return [...weeks.entries()].sort((a, b) => a[0] - b[0]).map(e => e[1]);
 }
 
+// Builds 2H or 3H candles from 1H candles. Buckets start at 00:00 UTC, the same alignment as
+// the 4H candles, so 3H candles open at 00, 03, 06 ... UTC. A bucket may hold fewer hours at the
+// weekend gap; it is still a real candle. The last bucket holds the forming 1H candle, so it is
+// still forming, and the CRT code drops it like any other forming candle.
+function hoursFromHourly(hourly, bucketSec) {
+  const buckets = new Map();
+  for (const c of hourly) {
+    const start = Math.floor(c.epoch / bucketSec) * bucketSec;
+    const b = buckets.get(start);
+    if (!b) {
+      buckets.set(start, { epoch: start, open: c.open, high: c.high, low: c.low, close: c.close });
+    } else {
+      b.high = Math.max(b.high, c.high);
+      b.low = Math.min(b.low, c.low);
+      b.close = c.close;
+    }
+  }
+  return [...buckets.values()].sort((a, b) => a.epoch - b.epoch);
+}
+
 /* =========================================================
    TELEGRAM
 ========================================================= */
@@ -978,6 +1042,65 @@ function sendCRTAlerts(pair, p, zones) {
 
     sendTelegram(message)
       .then(ok => log(`${ok ? 'Telegram sent' : 'Signal recorded'}: CRT ${c.direction} ${pair} ${c.timeframe}`))
+      .catch(err => {
+        log(`Telegram send failed: ${err.message}`);
+        state.lastError = `Telegram: ${err.message}`;
+      });
+  }
+}
+
+/* =========================================================
+   EARLY CRT WARNING (sweep candle closed, candle 3 not yet)
+========================================================= */
+
+const crtWarned = new Set();
+
+// Sends a "possible CRT" warning as soon as the sweep candle closes back inside the range,
+// without waiting for candle 3. The normal CRT message (above) still arrives when candle 3
+// confirms. If candle 3 fails, no further message is sent.
+function sendCRTWarnings(pair, p, zones, warnings) {
+  if (!CRT_ALERTS || CRT_MODE === 'off' || !CRT_CONFIRM_CANDLE3 || !Array.isArray(warnings)) return;
+  const now = Date.now();
+
+  for (const c of warnings) {
+    if (!CRT_ALERT_TFS.includes(c.timeframe)) continue;
+    const tf = ZONE_TIMEFRAMES.find(t => t.label === c.timeframe);
+    if (!tf) continue;
+
+    const key = `${pair}-${c.timeframe}-${c.direction}-${c.sweepEpoch}`;
+    if (crtWarned.has(key)) continue;
+    crtWarned.add(key);
+    if (crtWarned.size > 3000) crtWarned.clear(); // old keys fail the age check anyway
+
+    // Only warn about fresh sweeps: the sweep candle must have closed recently.
+    const closeMs = (c.sweepEpoch + tf.seconds) * 1000;
+    if (now - closeMs > CRT_ALERT_MAX_AGE_MS) continue;
+
+    const isBuy = c.direction === 'BUY';
+    const atZones = [...new Set(
+      (zones || [])
+        .filter(z => z.direction === c.direction && crtAtZone(c, z))
+        .map(z => `${z.timeframe} ${isBuy ? 'demand' : 'supply'}`)
+    )];
+    const source = p.source === 'twelvedata' ? 'Twelve Data' : 'Deriv';
+
+    const message = [
+      `⚠️ POSSIBLE CRT — ${c.direction} ${prettyPair(pair)} (${c.timeframe})`,
+      isBuy
+        ? `Bullish: the range low was swept, then price closed back inside.`
+        : `Bearish: the range high was swept, then price closed back inside.`,
+      `Waiting for candle 3 to close ${isBuy ? 'green' : 'red'} inside the range to confirm.`,
+      `CRT range: ${fmtPrice(pair, c.rangeLow)} – ${fmtPrice(pair, c.rangeHigh)}`,
+      `Sweep extreme: ${fmtPrice(pair, c.sweepExtreme)}`,
+      `Target: ${fmtPrice(pair, c.target)} (midpoint ${fmtPrice(pair, c.mid)})`,
+      atZones.length ? `Zone at the sweep: ${atZones.join(', ')}` : `Zone at the sweep: none found`,
+      Number.isFinite(p.price) ? `Price now: ${fmtPrice(pair, p.price)}` : null,
+      `Price source: ${source}`,
+      `ℹ️ Early warning only. Not confirmed until candle 3 closes.`
+    ].filter(Boolean).join('\n');
+
+    sendTelegram(message)
+      .then(ok => log(`${ok ? 'Telegram sent' : 'Signal recorded'}: POSSIBLE CRT ${c.direction} ${pair} ${c.timeframe}`))
       .catch(err => {
         log(`Telegram send failed: ${err.message}`);
         state.lastError = `Telegram: ${err.message}`;
@@ -1290,23 +1413,34 @@ async function scanPair(pair) {
     const newZones = [];
     let candles5m = null;
     const crtFound = [];
+    const crtWarnFound = [];
 
     let daily = null;
+    let hourly = null;
     for (const tf of ZONE_TIMEFRAMES) {
       let candles;
-      if (tf.derivedFrom) {
+      if (tf.derivedFrom === '1D') {
         // Weekly candles are built from the daily candles fetched just before.
         if (!daily) continue;
         candles = weeklyFromDaily(daily, p.source === 'deriv' ? 86400 : 0);
+      } else if (tf.derivedFrom === '1H') {
+        // 2H and 3H candles are built from the 1H candles fetched just before.
+        if (!hourly) continue;
+        candles = hoursFromHourly(hourly, tf.seconds);
       } else {
         candles = await getCandles(p, tf);
         await sleep(REQUEST_GAP_MS);
         if (tf.label === '1D') daily = candles;
+        if (tf.label === '1H') hourly = candles;
       }
       if (tf === TF_5M) candles5m = candles;
       if (CRT_TFS.some(t => t.label === tf.label)) {
         const found = detectCRT(candles, tf);
         if (found) crtFound.push(found);
+        if (CRT_CONFIRM_CANDLE3 && CRT_ALERT_TFS.includes(tf.label)) {
+          const warn = detectCRTWarning(candles, tf);
+          if (warn) crtWarnFound.push(warn);
+        }
       }
       if (tf.zones !== false) newZones.push(...makeZones(pair, tf, candles));
     }
@@ -1354,6 +1488,9 @@ async function scanPair(pair) {
 
     // Standalone CRT announcement (4H / 1D by default), independent of zone touches.
     sendCRTAlerts(pair, p, pruned);
+
+    // Early "possible CRT" warning: the sweep candle has closed, candle 3 has not.
+    sendCRTWarnings(pair, p, pruned, crtWarnFound);
 
     // 4. Fallback touch check when no live tick is available (e.g. Twelve Data crypto).
     if (!hasFreshTick) {
