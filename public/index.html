@@ -120,6 +120,15 @@
       <div class="value" id="signalCount">—</div>
     </div>
     <div class="card">
+      <div class="label">Active CRTs</div>
+      <div class="value" id="crtCount">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Crypto data requests</div>
+      <div class="value" id="tdUsage">—</div>
+      <div class="label" id="tdText">—</div>
+    </div>
+    <div class="card">
       <div class="label">Last updated</div>
       <div class="value" id="updated">—</div>
       <div class="label" id="scanText">—</div>
@@ -149,6 +158,99 @@
         </thead>
         <tbody id="approaching">
           <tr><td colspan="8">Waiting for zones...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h3>Zone + CRT confluence</h3>
+    <p class="muted">
+      Untested zones that price is in or near (within <span id="confPct">0.2</span>%),
+      where a CRT points the same way. "Yes" means the CRT's sweep happened at this zone,
+      which is what the bot needs before it sends a zone alert in filter mode. These are
+      the setups to watch first.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Market</th>
+            <th>Zone TF</th>
+            <th>Direction</th>
+            <th>Zone range</th>
+            <th>Distance</th>
+            <th>CRT timeframes</th>
+            <th>CRT at this zone</th>
+            <th>CRT target</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="confluence">
+          <tr><td colspan="9">Waiting for CRT data...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h3>CRT radar</h3>
+    <p class="muted">
+      Every confirmed CRT the bot is tracking right now, highest timeframe first.
+      A CRT is a candle that swept one side of the previous candle's range and closed
+      back inside it. The target is the other end of that range. "Zone at sweep" lists
+      your zones where the sweep happened.
+    </p>
+    <p class="note" id="crtSettings">Waiting for CRT settings...</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Market</th>
+            <th>Timeframe</th>
+            <th>Direction</th>
+            <th>CRT range</th>
+            <th>Sweep extreme</th>
+            <th>Target</th>
+            <th>Price</th>
+            <th>To target</th>
+            <th>Zone at sweep</th>
+            <th>Status</th>
+            <th>Candle closed</th>
+          </tr>
+        </thead>
+        <tbody id="crtRadar">
+          <tr><td colspan="11">Waiting for CRT data...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h3>CRT timeframe agreement</h3>
+    <p class="muted">
+      For each market that has a CRT, the direction on each timeframe. When several
+      timeframes point the same way, the setup has more behind it. "Mixed" means the
+      timeframes point opposite ways.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Market</th>
+            <th>1W</th>
+            <th>1D</th>
+            <th>4H</th>
+            <th>3H</th>
+            <th>2H</th>
+            <th>1H</th>
+            <th>30M</th>
+            <th>15M</th>
+            <th>Agreement</th>
+          </tr>
+        </thead>
+        <tbody id="crtAgree">
+          <tr><td colspan="10">Waiting for CRT data...</td></tr>
         </tbody>
       </table>
     </div>
@@ -352,11 +454,6 @@
     </div>
   </section>
 
-  <section>
-    <h3>System logs</h3>
-    <pre id="logs">Waiting for server...</pre>
-  </section>
-
   <footer>
     This dashboard displays data supplied by your bot server. It does not
     generate trading signals independently. Results, dollar values, the
@@ -393,14 +490,21 @@
   const STALE_SCAN_MIN = 15;
 
   // Higher timeframes rank first when zones are sorted.
-  const TF_RANK = { '1W': 9, '1D': 8, '12H': 7, '4H': 6, '2H': 5, '1H': 4, '30M': 3, '15M': 2, '5M': 1 };
+  const TF_RANK = { '1W': 9, '1D': 8, '12H': 7, '4H': 6, '3H': 5.5, '2H': 5, '1H': 4, '30M': 3, '15M': 2, '5M': 1 };
 
   // Timeframes shown in the summary table, highest first.
   const TF_ORDER = ['1W', '1D', '12H', '4H', '2H', '1H', '30M', '15M', '5M'];
 
+  // CRT panels: seconds per timeframe (to show when a CRT candle closed), the columns of
+  // the agreement table, and the zone tolerance used if the server does not report one.
+  const TF_SECONDS = { '5M': 300, '15M': 900, '30M': 1800, '1H': 3600, '2H': 7200, '3H': 10800, '4H': 14400, '1D': 86400, '1W': 604800 };
+  const AGREE_TFS = ['1W', '1D', '4H', '3H', '2H', '1H', '30M', '15M'];
+  const DEFAULT_CRT_TOL = 0.1;
+
   let latestPrices = {};
 
   el('approachPct').textContent = APPROACH_PCT;
+  el('confPct').textContent = APPROACH_PCT;
   el('lotSize').textContent = LOT;
 
   function escapeHtml(value) {
@@ -514,6 +618,200 @@
     const pct = (dist / price_) * 100;
     if (pct > APPROACH_PCT) return null;
     return { status: 'Approaching', pct, dist };
+  }
+
+  /* -------------------------------------------------------
+     CRT panels: radar, zone + CRT confluence, timeframe agreement
+  ------------------------------------------------------- */
+
+  // Same test the bot uses: does the area the CRT swept overlap this zone?
+  function crtAtZone(c, z, tol) {
+    const high = Number(c.rangeHigh);
+    const low = Number(c.rangeLow);
+    const sweep = Number(c.sweepExtreme);
+    const room = (Number.isFinite(high - low) ? high - low : 0) * tol;
+    const buy = c.direction === 'BUY';
+    const lo = (buy ? sweep : high) - room;
+    const hi = (buy ? low : sweep) + room;
+    return Number(z.bottom) <= hi && Number(z.top) >= lo;
+  }
+
+  // Names of the zones (same direction, same market) where this CRT's sweep happened.
+  function zonesAtSweep(c, zones, tol) {
+    const names = [];
+    for (const z of zones) {
+      if (z.pair !== c.pair || z.direction !== c.direction) continue;
+      if (!crtAtZone(c, z, tol)) continue;
+      names.push(z.timeframe + (z.direction === 'BUY' ? ' demand' : ' supply') + (z.tested ? ' (tested)' : ''));
+    }
+    return names;
+  }
+
+  // Where price is now compared with the CRT.
+  function crtStatus(c) {
+    const n = Number(c.price);
+    if (!Number.isFinite(n)) return { text: 'No price', cls: 'muted' };
+    const buy = c.direction === 'BUY';
+    if (buy ? n >= c.target : n <= c.target) return { text: 'Target reached', cls: 'muted' };
+    if (buy ? n <= c.sweepExtreme : n >= c.sweepExtreme) return { text: 'Past the sweep', cls: 'stale' };
+    if (buy ? n < c.rangeLow : n > c.rangeHigh) return { text: 'Back at the sweep', cls: 'near' };
+    return { text: 'Active', cls: 'strong' };
+  }
+
+  function byTimeframeDesc(a, b) {
+    return (TF_RANK[b.timeframe] || 0) - (TF_RANK[a.timeframe] || 0);
+  }
+
+  function renderCrtPanels(data, pairs, zones, priceByPair) {
+    const info = data.crt || null;
+    const tolValue = info ? Number(info.zoneTolerance) : NaN;
+    const tol = Number.isFinite(tolValue) ? tolValue : DEFAULT_CRT_TOL;
+    const onOff = v => (v === undefined ? 'unknown' : (v ? 'on' : 'off'));
+
+    // Crypto data usage card.
+    const td = data.twelveData;
+    if (td) {
+      el('tdUsage').textContent = `${td.usedToday}/${td.dailyBudget}`;
+      if (td.pausedUntil) {
+        el('tdText').textContent = 'Paused until ' + formatTime(td.pausedUntil);
+        el('tdText').className = 'stale';
+      } else {
+        el('tdText').textContent = td.cryptoScanEveryMin
+          ? `Crypto scan every ${td.cryptoScanEveryMin} min`
+          : 'Within budget';
+        el('tdText').className = 'label';
+      }
+    } else {
+      el('tdUsage').textContent = '—';
+      el('tdText').textContent = 'Not reported by the server';
+      el('tdText').className = 'label';
+    }
+
+    // Every CRT, tagged with its market and current price.
+    const all = [];
+    for (const p of pairs) {
+      const list = Array.isArray(p.crts) ? p.crts : [];
+      for (const c of list) all.push({ ...c, pair: p.pair, price: p.price });
+    }
+    all.sort((a, b) =>
+      byTimeframeDesc(a, b) ||
+      ((b.confirmEpoch || b.sweepEpoch || 0) - (a.confirmEpoch || a.sweepEpoch || 0))
+    );
+
+    el('crtCount').textContent = info ? all.length : '—';
+    el('crtSettings').textContent = info
+      ? `CRT mode: ${info.mode}. Timeframes: ${(info.timeframes || []).join(', ')}. ` +
+        `Candle 3 rule: ${onOff(info.confirmCandle3)}. Candle 2 colour rule: ${onOff(info.requireColor)}. ` +
+        `Sweep must be at a zone: ${info.atZone === undefined ? 'unknown' : (info.atZone ? 'yes' : 'no')}.`
+      : 'The server did not send CRT data. Update server.js to see the CRT panels.';
+
+    // 1. CRT radar
+    el('crtRadar').innerHTML = all.slice(0, 80).map(c => {
+      const buy = c.direction === 'BUY';
+      const st = crtStatus(c);
+      const n = Number(c.price);
+      const toTarget = Number.isFinite(n) && n > 0
+        ? (Math.abs(Number(c.target) - n) / n * 100).toFixed(2) + '%'
+        : '—';
+      const at = zonesAtSweep(c, zones, tol);
+      const epoch = Number(c.confirmEpoch || c.sweepEpoch);
+      const closedMs = Number.isFinite(epoch) ? (epoch + (TF_SECONDS[c.timeframe] || 0)) * 1000 : NaN;
+      const highTf = (TF_RANK[c.timeframe] || 0) >= 4;
+      return `
+        <tr>
+          <td>${escapeHtml(c.pair)}</td>
+          <td class="${highTf ? 'tf-high' : ''}">${escapeHtml(c.timeframe)}</td>
+          <td class="${buy ? 'buy' : 'sell'}">${escapeHtml(c.direction)}</td>
+          <td>${price(c.rangeLow, c.pair)} – ${price(c.rangeHigh, c.pair)}</td>
+          <td>${price(c.sweepExtreme, c.pair)}</td>
+          <td>${price(c.target, c.pair)}</td>
+          <td>${price(c.price, c.pair)}</td>
+          <td>${toTarget}</td>
+          <td class="${at.length ? 'strong' : 'muted'}">${at.length ? escapeHtml(at.join(', ')) : 'none'}</td>
+          <td class="${st.cls}">${escapeHtml(st.text)}</td>
+          <td>${formatTime(closedMs)}</td>
+        </tr>`;
+    }).join('') || '<tr><td colspan="11">No confirmed CRTs right now.</td></tr>';
+
+    // 2. Zone + CRT confluence
+    const crtsByPair = {};
+    for (const c of all) (crtsByPair[c.pair] = crtsByPair[c.pair] || []).push(c);
+
+    const conf = [];
+    for (const z of zones) {
+      if (z.tested) continue;
+      const near = approachInfo(z, priceByPair[z.pair]);
+      if (!near) continue;
+      const same = (crtsByPair[z.pair] || []).filter(c => c.direction === z.direction);
+      if (!same.length) continue;
+      const atZone = same.filter(c => crtAtZone(c, z, tol));
+      conf.push({ zone: z, near, same, atZone });
+    }
+    conf.sort((a, b) =>
+      (b.atZone.length > 0) - (a.atZone.length > 0) || a.near.pct - b.near.pct
+    );
+
+    el('confluence').innerHTML = conf.slice(0, 50).map(({ zone: z, near, same, atZone }) => {
+      const best = [...(atZone.length ? atZone : same)].sort(byTimeframeDesc)[0];
+      const tfs = [...same].sort(byTimeframeDesc).map(c => c.timeframe).join(' + ');
+      const highTf = (TF_RANK[z.timeframe] || 0) >= 4;
+      const statusClass = near.status === 'In zone' ? 'inzone' : 'near';
+      const distanceText = near.status === 'In zone' ? '0%' : near.pct.toFixed(3) + '%';
+      const atText = atZone.length
+        ? 'Yes: ' + [...atZone].sort(byTimeframeDesc).map(c => c.timeframe).join(' + ')
+        : 'No (CRT is elsewhere)';
+      return `
+        <tr>
+          <td>${escapeHtml(z.pair)}</td>
+          <td class="${highTf ? 'tf-high' : ''}">${escapeHtml(z.timeframe)}</td>
+          <td class="${z.direction === 'BUY' ? 'buy' : 'sell'}">${escapeHtml(z.direction)}</td>
+          <td>${price(z.bottom, z.pair)} – ${price(z.top, z.pair)}</td>
+          <td>${distanceText}</td>
+          <td>${escapeHtml(tfs)}</td>
+          <td class="${atZone.length ? 'strong' : 'muted'}">${escapeHtml(atText)}</td>
+          <td>${price(best.target, z.pair)}</td>
+          <td class="${statusClass}">${escapeHtml(near.status)}</td>
+        </tr>`;
+    }).join('') || '<tr><td colspan="9">No zone has a matching CRT right now.</td></tr>';
+
+    // 3. CRT timeframe agreement
+    const rows = [];
+    for (const p of pairs) {
+      const list = Array.isArray(p.crts) ? p.crts : [];
+      if (!list.length) continue;
+      const byTf = {};
+      for (const c of list) byTf[c.timeframe] = c.direction;
+      const dirs = Object.values(byTf);
+      rows.push({
+        pair: p.pair,
+        byTf,
+        buys: dirs.filter(d => d === 'BUY').length,
+        sells: dirs.filter(d => d === 'SELL').length
+      });
+    }
+    rows.sort((a, b) =>
+      (Math.min(a.buys, a.sells) === 0 ? 0 : 1) - (Math.min(b.buys, b.sells) === 0 ? 0 : 1) ||
+      Math.max(b.buys, b.sells) - Math.max(a.buys, a.sells)
+    );
+
+    el('crtAgree').innerHTML = rows.slice(0, 60).map(r => {
+      const cells = AGREE_TFS.map(tf => {
+        const d = r.byTf[tf];
+        if (!d) return '<td class="muted">—</td>';
+        return `<td class="${d === 'BUY' ? 'buy' : 'sell'}">${d}</td>`;
+      }).join('');
+      let agreement;
+      if (r.buys && r.sells) {
+        agreement = '<span class="stale">Mixed</span>';
+      } else {
+        const dir = r.buys ? 'BUY' : 'SELL';
+        const n = r.buys || r.sells;
+        agreement = n >= 2
+          ? `<span class="${dir === 'BUY' ? 'buy' : 'sell'}">All ${dir} (${n})</span>`
+          : `<span class="muted">${dir} only</span>`;
+      }
+      return `<tr><td>${escapeHtml(r.pair)}</td>${cells}<td>${agreement}</td></tr>`;
+    }).join('') || '<tr><td colspan="10">No markets have a CRT right now.</td></tr>';
   }
 
   /* -------------------------------------------------------
@@ -985,6 +1283,9 @@
         `;
       }).join('') || '<tr><td colspan="8">No zones are approaching right now.</td></tr>';
 
+      // CRT radar, zone + CRT confluence and timeframe agreement.
+      renderCrtPanels(data, pairs, zones, priceByPair);
+
       el('pairs').innerHTML = pairs.map(p => `
         <tr>
           <td>${escapeHtml(p.display || p.pair)}</td>
@@ -1038,15 +1339,10 @@
 
       renderTimeframeSummary(zones);
 
-      el('logs').textContent = Array.isArray(data.logs)
-        ? data.logs.join('\n')
-        : 'No logs available.';
-
     } catch (error) {
       el('connection').textContent = 'Dashboard error';
-      el('logs').textContent =
-        'Could not load /api/status. Check the server route and Railway logs.\n' +
-        error.message;
+      el('scanText').textContent = 'Could not load /api/status: ' + error.message;
+      el('scanText').className = 'stale';
     }
   }
 
