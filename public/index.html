@@ -238,6 +238,7 @@
         <thead>
           <tr>
             <th>Market</th>
+            <th>MN</th>
             <th>1W</th>
             <th>1D</th>
             <th>4H</th>
@@ -250,7 +251,7 @@
           </tr>
         </thead>
         <tbody id="crtAgree">
-          <tr><td colspan="10">Waiting for CRT data...</td></tr>
+          <tr><td colspan="11">Waiting for CRT data...</td></tr>
         </tbody>
       </table>
     </div>
@@ -490,15 +491,15 @@
   const STALE_SCAN_MIN = 15;
 
   // Higher timeframes rank first when zones are sorted.
-  const TF_RANK = { '1W': 9, '1D': 8, '12H': 7, '4H': 6, '3H': 5.5, '2H': 5, '1H': 4, '30M': 3, '15M': 2, '5M': 1 };
+  const TF_RANK = { 'MN': 10, '1W': 9, '1D': 8, '12H': 7, '4H': 6, '3H': 5.5, '2H': 5, '1H': 4, '30M': 3, '15M': 2, '5M': 1 };
 
   // Timeframes shown in the summary table, highest first.
   const TF_ORDER = ['1W', '1D', '12H', '4H', '2H', '1H', '30M', '15M', '5M'];
 
   // CRT panels: seconds per timeframe (to show when a CRT candle closed), the columns of
   // the agreement table, and the zone tolerance used if the server does not report one.
-  const TF_SECONDS = { '5M': 300, '15M': 900, '30M': 1800, '1H': 3600, '2H': 7200, '3H': 10800, '4H': 14400, '1D': 86400, '1W': 604800 };
-  const AGREE_TFS = ['1W', '1D', '4H', '3H', '2H', '1H', '30M', '15M'];
+  const TF_SECONDS = { '5M': 300, '15M': 900, '30M': 1800, '1H': 3600, '2H': 7200, '3H': 10800, '4H': 14400, '1D': 86400, '1W': 604800, 'MN': 2592000 };
+  const AGREE_TFS = ['MN', '1W', '1D', '4H', '3H', '2H', '1H', '30M', '15M'];
   const DEFAULT_CRT_TOL = 0.1;
 
   let latestPrices = {};
@@ -699,10 +700,13 @@
     );
 
     el('crtCount').textContent = info ? all.length : '—';
+    const atZoneText = info && info.atZone === undefined ? 'unknown' : (info && info.atZone ? 'yes' : 'no');
+    const rulesText = info && info.rules === 'marker'
+      ? 'Rules: same as the CRT Marker indicator (no colour or candle 3 rule). '
+      : `Candle 3 rule: ${info ? onOff(info.confirmCandle3) : ''}. Candle 2 colour rule: ${info ? onOff(info.requireColor) : ''}. `;
     el('crtSettings').textContent = info
       ? `CRT mode: ${info.mode}. Timeframes: ${(info.timeframes || []).join(', ')}. ` +
-        `Candle 3 rule: ${onOff(info.confirmCandle3)}. Candle 2 colour rule: ${onOff(info.requireColor)}. ` +
-        `Sweep must be at a zone: ${info.atZone === undefined ? 'unknown' : (info.atZone ? 'yes' : 'no')}.`
+        rulesText + `Sweep must be at a zone: ${atZoneText}.`
       : 'The server did not send CRT data. Update server.js to see the CRT panels.';
 
     // 1. CRT radar
@@ -715,7 +719,15 @@
         : '—';
       const at = zonesAtSweep(c, zones, tol);
       const epoch = Number(c.confirmEpoch || c.sweepEpoch);
-      const closedMs = Number.isFinite(epoch) ? (epoch + (TF_SECONDS[c.timeframe] || 0)) * 1000 : NaN;
+      let closedMs = NaN;
+      if (Number.isFinite(epoch)) {
+        if (c.timeframe === 'MN') {
+          const m = new Date(epoch * 1000);
+          closedMs = Date.UTC(m.getUTCFullYear(), m.getUTCMonth() + 1, 1);
+        } else {
+          closedMs = (epoch + (TF_SECONDS[c.timeframe] || 0)) * 1000;
+        }
+      }
       const highTf = (TF_RANK[c.timeframe] || 0) >= 4;
       return `
         <tr>
@@ -811,7 +823,7 @@
           : `<span class="muted">${dir} only</span>`;
       }
       return `<tr><td>${escapeHtml(r.pair)}</td>${cells}<td>${agreement}</td></tr>`;
-    }).join('') || '<tr><td colspan="10">No markets have a CRT right now.</td></tr>';
+    }).join('') || '<tr><td colspan="11">No markets have a CRT right now.</td></tr>';
   }
 
   /* -------------------------------------------------------
